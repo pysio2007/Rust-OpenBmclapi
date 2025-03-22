@@ -1,5 +1,3 @@
-use colored::Colorize;
-use log::{debug, error, info, warn};
 
 // 这个文件在Rust中可能不需要，因为我们已经使用了env_logger库
 // 但为了保持与原项目相同的结构，我们仍然保留此文件

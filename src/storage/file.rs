@@ -2,18 +2,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
-use futures::stream::StreamExt;
 use std::collections::HashSet;
-use std::path::{PathBuf, Path};
+use std::path::PathBuf;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use colored::Colorize;
 
 use log::info;
-use crate::storage::base::{Storage, RequestHandler};
+use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
-use crate::util::hash_to_filename;
 
 pub struct FileStorage {
     cache_dir: PathBuf,

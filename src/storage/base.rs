@@ -11,6 +11,7 @@ use crate::storage::alist_webdav::AlistWebdavStorage;
 use log::info;
 
 // 为handle_request方法创建新的trait
+#[allow(dead_code)]
 #[async_trait]
 pub trait RequestHandler<B> {
     async fn handle_request(&self, hash_path: &str, req: Request<B>) -> Result<Response<axum::body::Body>>;

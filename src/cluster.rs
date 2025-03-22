@@ -9,21 +9,18 @@ use axum::{
 };
 use reqwest::Client;
 use log::{debug, error, info, warn};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::time;
 
 use crate::config::CONFIG;
-use crate::openapi::{OpenbmclapiAgentConfiguration, OpenbmclapiBaseConfiguration};
+use crate::openapi::OpenbmclapiAgentConfiguration;
 use crate::storage::Storage;
 use crate::storage::get_storage;
 use crate::token::TokenManager;
-use crate::types::{Counters, FileInfo, FileList, GCCounter};
+use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
-use crate::util::hash_to_filename;
 
 pub struct Cluster {
     client: Client,
@@ -513,7 +510,7 @@ impl std::fmt::Debug for Cluster {
 async fn serve_file(
     State(cluster): State<Arc<Cluster>>,
     Path(hash_path): Path<String>,
-    req: Request<axum::body::Body>,
+    _req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     

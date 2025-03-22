@@ -2,16 +2,13 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
-use log::info;
-use reqwest::{Client, StatusCode as ReqStatusCode};
+use reqwest::Client;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use crate::storage::base::{Storage, RequestHandler};
+use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
-use crate::util::hash_to_filename;
 
 pub struct AlistWebdavStorage {
     client: Client,
@@ -19,6 +16,7 @@ pub struct AlistWebdavStorage {
     username: String,
     password: String,
     path: String,
+    #[allow(dead_code)]
     temp_dir: String,
 }
 

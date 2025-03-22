@@ -1,11 +1,10 @@
 use anyhow::Result;
-use async_trait::async_trait;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use log::{error, info};
+use jsonwebtoken::{encode, EncodingKey, Header};
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -19,6 +18,7 @@ struct Claims {
 pub struct TokenManager {
     cluster_id: String,
     cluster_secret: String,
+    #[allow(dead_code)]
     version: String,
     token: Arc<RwLock<Option<String>>>,
     refresh_lock: Arc<Mutex<()>>,

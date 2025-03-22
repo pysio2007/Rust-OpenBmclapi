@@ -1,13 +1,11 @@
 use anyhow::{anyhow, Result};
-use axum::Router;
-use axum::http::StatusCode;
 use colored::Colorize;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::time::{self, Instant};
+use tokio::time::{self};
 use tokio::sync::mpsc;
 use tokio::net::TcpListener;
 
@@ -43,7 +41,7 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     keepalive.start().await;
     
     // 设置HTTPS
-    let use_https = true; // 默认使用HTTPS
+    let _use_https = true; // 默认使用HTTPS
     let mut proto = "https";
     
     if config.byoc {

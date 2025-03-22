@@ -76,7 +76,6 @@ impl ClusterManager {
             // Unix系统上发送SIGTERM信号
             #[cfg(unix)]
             {
-                use std::os::unix::process::CommandExt;
                 let pid = worker.process.id();
                 let _ = Command::new("kill")
                     .arg("-TERM")

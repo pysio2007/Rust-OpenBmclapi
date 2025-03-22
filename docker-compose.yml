@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  rust-bmclapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 如果使用预构建镜像，可以取消下行注释并注释上面的build部分
+    # image: yourusername/rust-bmclapi:latest
+    container_name: rust-bmclapi
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - RUST_LOG=info
+      # 以下环境变量也可以放在.env文件中
+      # - CLUSTER_ID=your_cluster_id
+      # - CLUSTER_SECRET=your_cluster_secret
+      # - CLUSTER_PORT=4000
+      # - CLUSTER_PUBLIC_PORT=4000
+      # - ENABLE_UPNP=false
+    volumes:
+      - ./cache:/app/cache
+      - ./.env:/app/.env:ro
+    # 如果使用主机网络（可以获取真实IP，方便UPnP等功能）
+    # network_mode: "host" 

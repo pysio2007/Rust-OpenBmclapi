@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 环境配置
+.env
+
+# 缓存目录
+/cache
+/tmp
+
+# 其他
+README.md
+LICENSE
+.DS_Store
+*.log 

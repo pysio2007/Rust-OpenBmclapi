@@ -7,10 +7,15 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 use colored::Colorize;
+use tokio::time::{sleep, Duration};
+use sha2::{Sha256, Digest};
 
-use log::info;
+use log::{info, warn, error};
 use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
+
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY: u64 = 5;
 
 pub struct FileStorage {
     cache_dir: PathBuf,
@@ -19,6 +24,50 @@ pub struct FileStorage {
 impl FileStorage {
     pub fn new(cache_dir: PathBuf) -> Self {
         Self { cache_dir }
+    }
+    
+    async fn verify_file(&self, path: &str, expected_hash: &str) -> Result<bool> {
+        let file_path = self.cache_dir.join(path);
+        
+        let content = match fs::read(&file_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                error!("读取文件失败: {} - {}", file_path.display(), e);
+                return Ok(false);
+            }
+        };
+        
+        let mut hasher = Sha256::new();
+        hasher.update(&content);
+        let actual_hash = format!("{:x}", hasher.finalize());
+        
+        Ok(actual_hash == expected_hash)
+    }
+    
+    async fn retry_operation<F, Fut, T>(&self, operation: F, description: &str) -> Result<T>
+    where
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+        T: Send + 'static,
+    {
+        let mut retries = 0;
+        let mut last_error = None;
+        
+        while retries < MAX_RETRIES {
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!("{} 重试 {}/{}: {}", description, retries + 1, MAX_RETRIES, e);
+                    last_error = Some(e);
+                    retries += 1;
+                    if retries < MAX_RETRIES {
+                        sleep(Duration::from_secs(RETRY_DELAY)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("最大重试次数已用完")))
     }
 }
 
@@ -41,7 +90,7 @@ impl Storage for FileStorage {
         Ok(true)
     }
     
-    async fn write_file(&self, path: String, content: Vec<u8>, _file_info: &FileInfo) -> Result<()> {
+    async fn write_file(&self, path: String, content: Vec<u8>, file_info: &FileInfo) -> Result<()> {
         let file_path = self.cache_dir.join(&path);
         
         // 确保父目录存在
@@ -49,7 +98,26 @@ impl Storage for FileStorage {
             fs::create_dir_all(parent).await?;
         }
         
-        fs::write(file_path, content).await?;
+        // 克隆数据用于闭包
+        let file_path_clone = file_path.clone();
+        let content_clone = content.clone();
+        
+        // 写入文件
+        self.retry_operation(move || {
+            let file_path = file_path_clone.clone();
+            let content = content_clone.clone();
+            
+            async move {
+                Ok(fs::write(file_path, content).await?)
+            }
+        }, "写入文件").await?;
+        
+        // 验证文件完整性
+        if !self.verify_file(&path, &file_info.hash).await? {
+            fs::remove_file(&file_path).await?;
+            return Err(anyhow::anyhow!("文件完整性验证失败"));
+        }
+        
         Ok(())
     }
     
@@ -67,7 +135,7 @@ impl Storage for FileStorage {
         
         for file in files {
             let hash_path = self.cache_dir.join(&file.hash);
-            if !hash_path.exists() {
+            if !hash_path.exists() || !self.verify_file(&file.hash, &file.hash).await? {
                 missing_files.push(file.clone());
             }
         }
@@ -86,11 +154,23 @@ impl Storage for FileStorage {
         let mut queue = vec![self.cache_dir.clone()];
         
         while let Some(dir) = queue.pop() {
-            let mut entries = fs::read_dir(dir).await?;
+            let mut entries = match fs::read_dir(&dir).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    error!("读取目录失败: {} - {}", dir.display(), e);
+                    continue;
+                }
+            };
             
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                let metadata = entry.metadata().await?;
+                let metadata = match entry.metadata().await {
+                    Ok(metadata) => metadata,
+                    Err(e) => {
+                        error!("读取文件元数据失败: {} - {}", path.display(), e);
+                        continue;
+                    }
+                };
                 
                 if metadata.is_dir() {
                     queue.push(path);
@@ -105,7 +185,10 @@ impl Storage for FileStorage {
                     
                 if !file_set.contains(&relative_path) {
                     info!("{}", format!("删除过期文件: {}", path.display()).dimmed());
-                    fs::remove_file(&path).await?;
+                    if let Err(e) = fs::remove_file(&path).await {
+                        error!("删除文件失败: {} - {}", path.display(), e);
+                        continue;
+                    }
                     counter.count += 1;
                     counter.size += metadata.len();
                 }

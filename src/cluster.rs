@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, State, Query},
     routing::get,
     Router,
     body::Body,
@@ -197,6 +197,120 @@ impl Cluster {
             .route("/files/:hash_path", get(serve_file))
             .route("/measure/:size", get(measure_handler))
             .route("/auth", get(auth_handler))
+            .route("/list/directory", get(
+                |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
+                    // 从URL中提取sign和path参数
+                    let sign = params.get("sign");
+                    let path = params.get("path").unwrap_or(&String::from("")).clone();
+                    
+                    if sign.is_none() {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from("Missing signature"))
+                            .unwrap();
+                    }
+                
+                    // 获取config的读锁
+                    let cluster_secret = {
+                        let config = CONFIG.read().unwrap();
+                        config.cluster_secret.clone()
+                    };
+                    
+                    // 计算验证数据
+                    let verify_path = format!("/list/directory?path={}", path);
+                    if !crate::util::check_sign(verify_path.as_bytes(), sign.unwrap(), &cluster_secret) {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from("Invalid signature"))
+                            .unwrap();
+                    }
+                
+                    // 获取存储实例
+                    let _storage = cluster.get_storage();
+                    let storage_path = std::path::Path::new("cache").join(&path);
+                    
+                    // 异步读取目录内容
+                    match tokio::fs::read_dir(storage_path).await {
+                        Ok(mut entries) => {
+                            let mut files = Vec::new();
+                            
+                            // 读取目录中的所有条目
+                            while let Ok(Some(entry)) = entries.next_entry().await {
+                                if let Ok(metadata) = entry.metadata().await {
+                                    let entry_type = if metadata.is_dir() { "directory" } else { "file" };
+                                    let filename = entry.file_name().to_string_lossy().to_string();
+                                    let size = if metadata.is_file() { metadata.len() } else { 0 };
+                                    
+                                    files.push(serde_json::json!({
+                                        "name": filename,
+                                        "type": entry_type,
+                                        "size": size,
+                                    }));
+                                }
+                            }
+                            
+                            // 返回JSON响应
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(serde_json::to_string(&serde_json::json!({
+                                    "path": path,
+                                    "files": files
+                                })).unwrap()))
+                                .unwrap()
+                        },
+                        Err(e) => {
+                            Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::from(format!("Failed to read directory: {}", e)))
+                                .unwrap()
+                        }
+                    }
+                }
+            ))
+            .route("/metrics", get(
+                |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
+                    // 从URL中提取sign参数
+                    let sign = params.get("sign");
+                    if sign.is_none() {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from("Missing signature"))
+                            .unwrap();
+                    }
+                
+                    // 获取config的读锁并立即释放，避免Send问题
+                    let cluster_secret = {
+                        let config = CONFIG.read().unwrap();
+                        config.cluster_secret.clone()
+                    };
+                    
+                    // 计算验证数据
+                    let path = "/metrics";
+                    if !crate::util::check_sign(path.as_bytes(), sign.unwrap(), &cluster_secret) {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from("Invalid signature"))
+                            .unwrap();
+                    }
+                
+                    // 获取计数器
+                    let counters = cluster.counters.read().unwrap().clone();
+                    
+                    // 返回JSON响应
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::to_string(&serde_json::json!({
+                            "metrics": {
+                                "hits": counters.hits,
+                                "bytes": counters.bytes,
+                            },
+                            "timestamp": chrono::Utc::now().timestamp()
+                        })).unwrap()))
+                        .unwrap()
+                }
+            ))
             .with_state(cluster)
     }
     
@@ -521,7 +635,18 @@ async fn serve_file(
     
     // 请求处理
     match storage.as_ref().handle_bytes_request(&hash_path, empty_req).await {
-        Ok(response) => response,
+        Ok(response) => {
+            // 获取文件大小并更新计数器
+            if let Some(content_length) = response.headers().get(axum::http::header::CONTENT_LENGTH) {
+                if let Ok(size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
+                    let mut counters = cluster.counters.write().unwrap();
+                    counters.hits += 1;
+                    counters.bytes += size;
+                }
+            }
+            
+            response
+        },
         Err(e) => {
             error!("处理文件请求失败: {}", e);
             Response::builder()

@@ -12,8 +12,9 @@ pub struct ConfigFlavor {
     pub storage: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    // 基本配置
     pub cluster_id: String,
     pub cluster_secret: String,
     pub cluster_ip: Option<String>,
@@ -22,14 +23,23 @@ pub struct Config {
     pub byoc: bool,
     pub disable_access_log: bool,
     
-    pub enable_nginx: bool,
-    pub enable_upnp: bool,
+    // 存储配置
     pub storage: String,
     pub storage_opts: Option<serde_json::Value>,
     
+    // SSL配置
     pub ssl_key: Option<String>,
     pub ssl_cert: Option<String>,
     
+    // 功能开关
+    pub enable_nginx: bool,
+    pub enable_upnp: bool,
+    pub enable_metrics: bool,
+    
+    // 高级选项
+    pub debug_log: bool,
+    
+    // 运行时信息
     pub flavor: ConfigFlavor,
 }
 
@@ -50,6 +60,7 @@ impl Config {
         
         let enable_nginx = env::var("ENABLE_NGINX").map(|v| v == "true" || v == "1").unwrap_or(false);
         let enable_upnp = env::var("ENABLE_UPNP").map(|v| v == "true" || v == "1").unwrap_or(false);
+        let enable_metrics = env::var("ENABLE_METRICS").map(|v| v == "true" || v == "1").unwrap_or(false);
         
         let storage = env::var("CLUSTER_STORAGE").unwrap_or_else(|_| "file".to_string());
         let storage_opts = env::var("CLUSTER_STORAGE_OPTIONS")
@@ -58,6 +69,9 @@ impl Config {
         
         let ssl_key = env::var("SSL_KEY").ok();
         let ssl_cert = env::var("SSL_CERT").ok();
+        
+        // 高级选项
+        let debug_log = env::var("DEBUG_LOG").map(|v| v == "true" || v == "1").unwrap_or(false);
         
         let flavor = ConfigFlavor {
             runtime: format!("Rust/{}", env!("CARGO_PKG_VERSION")),
@@ -74,10 +88,12 @@ impl Config {
             disable_access_log,
             enable_nginx,
             enable_upnp,
+            enable_metrics,
             storage,
             storage_opts,
             ssl_key,
             ssl_cert,
+            debug_log,
             flavor,
         })
     }

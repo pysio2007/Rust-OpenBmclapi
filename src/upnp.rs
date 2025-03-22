@@ -1,9 +1,12 @@
 use anyhow::{anyhow, Result};
-use log::{error, info};
+use log::{error, info, warn};
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use std::sync::Arc;
 use igd::{self, Gateway, SearchOptions};
+
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY: u64 = 5;
 
 // 创建Gateway的包装器，实现Clone
 struct GatewayWrapper {
@@ -20,8 +23,54 @@ impl GatewayWrapper {
         }
     }
     
+    fn add_port_with_retry(&self, protocol: igd::PortMappingProtocol, port: u16, local_addr: std::net::SocketAddrV4, lease_duration: u32, description: &str) -> igd::Result<()> {
+        let mut retries = 0;
+        let mut last_error = None;
+        
+        while retries < MAX_RETRIES {
+            match self.add_port(protocol, port, local_addr, lease_duration, description) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!("UPnP端口映射重试 {}/{}：{}", retries + 1, MAX_RETRIES, e);
+                    last_error = Some(e);
+                    retries += 1;
+                    if retries < MAX_RETRIES {
+                        std::thread::sleep(Duration::from_secs(RETRY_DELAY));
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| {
+            igd::Error::RequestError(igd::RequestError::InvalidResponse("最大重试次数已用完".to_string()))
+        }))
+    }
+    
     fn add_port(&self, protocol: igd::PortMappingProtocol, port: u16, local_addr: std::net::SocketAddrV4, lease_duration: u32, description: &str) -> igd::Result<()> {
         Ok(self.inner.add_port(protocol, port, local_addr, lease_duration, description)?)
+    }
+    
+    fn get_external_ip_with_retry(&self) -> igd::Result<Ipv4Addr> {
+        let mut retries = 0;
+        let mut last_error = None;
+        
+        while retries < MAX_RETRIES {
+            match self.get_external_ip() {
+                Ok(ip) => return Ok(ip),
+                Err(e) => {
+                    warn!("获取外部IP重试 {}/{}：{}", retries + 1, MAX_RETRIES, e);
+                    last_error = Some(e);
+                    retries += 1;
+                    if retries < MAX_RETRIES {
+                        std::thread::sleep(Duration::from_secs(RETRY_DELAY));
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| {
+            igd::Error::RequestError(igd::RequestError::InvalidResponse("最大重试次数已用完".to_string()))
+        }))
     }
     
     fn get_external_ip(&self) -> igd::Result<Ipv4Addr> {
@@ -63,7 +112,7 @@ pub async fn setup_upnp(port: u16, public_port: u16) -> Result<String> {
     // 获取外部IP
     let get_ip_result = tokio::task::spawn_blocking({
         let gateway = gateway.clone();
-        move || gateway.get_external_ip()
+        move || gateway.get_external_ip_with_retry()
     }).await?;
     
     let external_ip = match get_ip_result {
@@ -86,7 +135,7 @@ pub async fn setup_upnp(port: u16, public_port: u16) -> Result<String> {
     let add_port_result = tokio::task::spawn_blocking({
         let gateway = gateway.clone();
         move || {
-            gateway.add_port(
+            gateway.add_port_with_retry(
                 igd::PortMappingProtocol::TCP,
                 port,
                 std::net::SocketAddrV4::new(local_ip, public_port),
@@ -97,7 +146,10 @@ pub async fn setup_upnp(port: u16, public_port: u16) -> Result<String> {
     }).await?;
     
     match add_port_result {
-        Ok(_) => info!("UPnP端口映射已添加: {}:{} -> 内部端口 {}", gateway.addr, public_port, port),
+        Ok(_) => {
+            info!("UPnP端口映射已添加: {}:{} -> 内部端口 {}", gateway.addr, public_port, port);
+            info!("外部IP地址: {}", external_ip);
+        },
         Err(e) => {
             error!("UPnP端口映射失败: {}", e);
             return Err(anyhow!("UPnP端口映射失败: {}", e));

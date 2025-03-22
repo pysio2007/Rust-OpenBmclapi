@@ -1,8 +1,8 @@
 [package]
 name = "rust-bmclapi"
-version = "0.1.0"
+version = "1.13.1"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Pysio <qq593277393@outlook.com>"]
 description = "Rust implementation of OpenBMCLAPI"
 
 [dependencies]

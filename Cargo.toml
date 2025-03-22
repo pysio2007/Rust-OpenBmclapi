@@ -1,0 +1,48 @@
+[package]
+name = "rust-bmclapi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "Rust implementation of OpenBMCLAPI"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["multipart"] }
+hyper = { version = "1.0", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "stream"] }
+dotenv = "0.15"
+config = "0.13"
+clap = { version = "4.4", features = ["derive"] }
+futures = "0.3"
+bytes = "1.5"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+tempfile = "3.8"
+indicatif = "0.17"
+colored = "2.0"
+log = "0.4"
+env_logger = "0.10"
+zstd = "0.13"
+socket2 = "0.5"
+igd = "0.12"
+jsonwebtoken = "8.3"
+async-recursion = "1.0"
+lazy_static = "1.4"
+# SSL和HTTPS相关依赖
+hyper-rustls = "0.25"
+rustls = "0.22"
+rustls-pemfile = "2.0"
+rustls-pki-types = "1.0"
+async-stream = "0.3"

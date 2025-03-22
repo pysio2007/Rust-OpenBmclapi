@@ -40,6 +40,9 @@ igd = "0.12"
 jsonwebtoken = "8.3"
 async-recursion = "1.0"
 lazy_static = "1.4"
+url = "2.4"
+winapi = { version = "0.3", features = ["processthreadsapi", "handleapi"] }
+num_cpus = "1.16"
 # SSL和HTTPS相关依赖
 hyper-rustls = "0.25"
 rustls = "0.22"

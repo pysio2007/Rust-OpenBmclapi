@@ -195,6 +195,8 @@ impl Cluster {
         
         Router::new()
             .route("/files/:hash_path", get(serve_file))
+            .route("/measure/:size", get(measure_handler))
+            .route("/auth", get(auth_handler))
             .with_state(cluster)
     }
     
@@ -572,4 +574,131 @@ async fn find_public_ip() -> Result<String> {
     }
     
     Err(anyhow!("无法获取公网IP"))
+}
+
+// 测速处理函数
+async fn measure_handler(
+    Path(size): Path<u32>,
+    State(_cluster): State<Arc<Cluster>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    // 检查请求是否带有合法签名
+    let query_params = req.uri().query().unwrap_or("");
+    let query_dict: HashMap<String, String> = query_params
+        .split('&')
+        .filter_map(|item| {
+            let split: Vec<&str> = item.split('=').collect();
+            if split.len() == 2 {
+                Some((split[0].to_string(), split[1].to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // 从URL中提取sign参数
+    let sign = query_dict.get("sign");
+    if sign.is_none() {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Missing signature"))
+            .unwrap();
+    }
+
+    // 获取config的读锁
+    let config = CONFIG.read().unwrap();
+    
+    // 计算验证数据
+    let path = format!("/measure/{}", size);
+    if !crate::util::check_sign(path.as_bytes(), sign.unwrap(), &config.cluster_secret) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Invalid signature"))
+            .unwrap();
+    }
+
+    // 检查请求的大小是否合理
+    if size > 200 {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Size too large"))
+            .unwrap();
+    }
+
+    // 生成指定大小的数据
+    let buffer_size = 1024 * 1024; // 1MB
+    let buffer = vec![0u8; buffer_size];
+
+    // 创建异步数据流
+    let stream = tokio_stream::iter(std::iter::repeat_with(move || {
+        Ok::<_, std::io::Error>(bytes::Bytes::from(buffer.clone()))
+    }).take(size as usize));
+
+    // 创建响应
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Length", (size as usize * buffer_size).to_string())
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+// 认证处理函数
+async fn auth_handler(req: Request<Body>) -> impl IntoResponse {
+    // 获取原始URL
+    let original_uri = req.headers().get("x-original-uri");
+    if original_uri.is_none() {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Missing original URI"))
+            .unwrap();
+    }
+    
+    let original_uri = original_uri.unwrap().to_str().unwrap_or("");
+    
+    // 解析URL
+    let url = match url::Url::parse(&format!("http://localhost{}", original_uri)) {
+        Ok(url) => url,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from("Invalid URI"))
+                .unwrap();
+        }
+    };
+    
+    // 从路径中提取hash
+    let path = url.path();
+    let hash = path.split('/').last().unwrap_or("");
+    
+    // 从查询参数中获取sign
+    let query_params: HashMap<String, String> = url.query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    
+    let sign = match query_params.get("sign") {
+        Some(s) => s,
+        None => {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from("Missing signature"))
+                .unwrap();
+        }
+    };
+    
+    // 获取配置
+    let config = CONFIG.read().unwrap();
+    
+    // 验证签名
+    if !crate::util::check_sign(hash.as_bytes(), sign, &config.cluster_secret) {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Invalid signature"))
+            .unwrap();
+    }
+    
+    // 签名验证通过
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
 } 

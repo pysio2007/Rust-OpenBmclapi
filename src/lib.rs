@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod cluster;
+pub mod cluster_manager;
 pub mod config;
 pub mod constants;
 pub mod file;

@@ -141,8 +141,8 @@ impl Storage for FileStorage {
         // 创建一个Arc引用以便在多个任务间共享
         let self_arc = Arc::new(self.clone());
         
-        // 使用信号量限制并发数量为4
-        let semaphore = Arc::new(Semaphore::new(4));
+        // 使用信号量限制并发数量为32
+        let semaphore = Arc::new(Semaphore::new(32));
         
         // 使用一个计数器跟踪进度
         let checked_count = Arc::new(tokio::sync::Mutex::new(0));
@@ -237,7 +237,7 @@ impl Storage for FileStorage {
                     }
                 }
             })
-            .buffer_unordered(16) // 最多同时进行4个并发任务
+            .buffer_unordered(32) // 最多同时进行32个并发任务
             .collect::<Vec<(FileInfo, bool)>>()
             .await;
         

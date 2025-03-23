@@ -133,21 +133,44 @@ impl Storage for FileStorage {
     
     async fn get_missing_files(&self, files: &[FileInfo]) -> Result<Vec<FileInfo>> {
         let mut missing_files = Vec::new();
+        let mut checked_count = 0;
+        let total_files = files.len();
         
         for file in files {
-            let relative_path = hash_to_filename(&file.hash);
-            let file_path = self.cache_dir.join(&relative_path);
+            let hash_path = hash_to_filename(&file.hash);
+            let file_path = self.cache_dir.join(&hash_path);
             
-            debug!("检查文件 {} (哈希值: {})", file.path, file.hash);
-            debug!("对应的本地路径: {}", file_path.display());
+            checked_count += 1;
+            if checked_count % 100 == 0 {
+                debug!("已检查 {}/{} 个文件", checked_count, total_files);
+            }
             
+            // 首先检查文件是否存在
             if !file_path.exists() {
                 debug!("文件不存在: {}", file_path.display());
                 missing_files.push(file.clone());
                 continue;
             }
             
-            match self.verify_file(&relative_path, &file.hash).await {
+            // 检查文件大小
+            match fs::metadata(&file_path).await {
+                Ok(metadata) => {
+                    if metadata.len() != file.size {
+                        debug!("文件大小不匹配: {} (期望: {}, 实际: {})", 
+                              file.path, file.size, metadata.len());
+                        missing_files.push(file.clone());
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    error!("获取文件元数据失败: {} - {}", file_path.display(), e);
+                    missing_files.push(file.clone());
+                    continue;
+                }
+            }
+            
+            // 如果文件存在且大小正确，再验证哈希值
+            match self.verify_file(&hash_path, &file.hash).await {
                 Ok(true) => {
                     debug!("文件验证成功: {}", file.path);
                 },
@@ -164,6 +187,8 @@ impl Storage for FileStorage {
         
         if !missing_files.is_empty() {
             info!("发现 {} 个缺失或损坏的文件", missing_files.len());
+        } else {
+            info!("所有文件完整性检查通过");
         }
         
         Ok(missing_files)
@@ -174,7 +199,7 @@ impl Storage for FileStorage {
         
         // 构建有效文件的集合
         let file_set: HashSet<String> = files.iter()
-            .map(|file| file.hash.clone())
+            .map(|file| file.hash.to_lowercase())
             .collect();
         
         let mut queue = vec![self.cache_dir.clone()];
@@ -203,20 +228,18 @@ impl Storage for FileStorage {
                     continue;
                 }
                 
-                // 检查文件是否在有效文件列表中
-                let relative_path = path.strip_prefix(&self.cache_dir)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-                    
-                if !file_set.contains(&relative_path) {
-                    info!("{}", format!("删除过期文件: {}", path.display()).dimmed());
-                    if let Err(e) = fs::remove_file(&path).await {
-                        error!("删除文件失败: {} - {}", path.display(), e);
-                        continue;
+                // 从文件路径中提取哈希值
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    let hash = file_name.to_lowercase();
+                    if !file_set.contains(&hash) {
+                        info!("{}", format!("删除过期文件: {}", path.display()).dimmed());
+                        if let Err(e) = fs::remove_file(&path).await {
+                            error!("删除文件失败: {} - {}", path.display(), e);
+                            continue;
+                        }
+                        counter.count += 1;
+                        counter.size += metadata.len();
                     }
-                    counter.count += 1;
-                    counter.size += metadata.len();
                 }
             }
         }

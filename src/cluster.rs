@@ -480,15 +480,17 @@ impl Cluster {
     
     pub async fn enable(&self) -> Result<()> {
         if *self.is_enabled.read().unwrap() {
+            debug!("节点已经处于启用状态，无需重复启用");
             return Ok(());
         }
         
         {
             let mut want_enable = self.want_enable.write().unwrap();
             *want_enable = true;
+            debug!("已设置 want_enable = true");
         }
         
-        info!("启用集群...");
+        info!("开始启用集群节点...");
         
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
@@ -496,87 +498,134 @@ impl Cluster {
         };
         
         let socket = match socket_opt {
-            Some(socket) => socket,
-            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
-        };
-        
-        let public_ip = match Self::find_public_ip().await {
-            Ok(ip) => ip,
-            Err(e) => {
-                error!("无法获取公网IP地址: {}", e);
-                return Err(anyhow!("无法获取公网IP地址: {}", e));
+            Some(socket) => {
+                debug!("获取到有效的Socket.IO连接");
+                socket
+            },
+            None => {
+                error!("Socket.IO连接未初始化，请先调用connect()方法建立连接");
+                return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接"));
             }
         };
         
-        info!("获取到公网IP地址: {}", public_ip);
+        let host = self.host.clone().unwrap_or_else(|| "".to_string());
+        debug!("使用主机地址: {}", if host.is_empty() { "<空>" } else { &host });
         
-        let host = self.host.clone().unwrap_or_else(|| public_ip);
+        let byoc = {
+            let config = CONFIG.read().unwrap();
+            config.byoc
+        };
+        debug!("BYOC设置: {}", byoc);
+        
+        let flavor = {
+            let config = CONFIG.read().unwrap();
+            config.flavor.clone()
+        };
+        debug!("运行时环境: {}/{}", flavor.runtime, flavor.storage);
+        
+        let no_fast_enable = std::env::var("NO_FAST_ENABLE").unwrap_or_else(|_| "false".to_string()) == "true";
+        debug!("快速启用模式: {}", !no_fast_enable);
+        
         let payload = json!({
             "host": host,
             "port": self.public_port,
             "version": env!("CARGO_PKG_VERSION"),
+            "byoc": byoc,
+            "noFastEnable": no_fast_enable,
+            "flavor": flavor,
         });
         
-        debug!("发送的payload: {}", payload);
+        info!("准备发送的注册数据: {}", payload);
         
-        let is_enabled = self.is_enabled.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         
         let ack_callback = move |message: Payload, _| {
-            let is_enabled = is_enabled.clone();
+            let tx = tx.clone();
             async move {
                 debug!("收到enable响应回调");
                 match message {
                     Payload::Text(values) => {
                         debug!("处理enable响应的文本数据: {:?}", values);
                         
+                        // 克隆整个values数组以避免生命周期问题
+                        let values = values.to_vec();
+                        
                         if values.len() < 2 {
-                            error!("启用集群响应格式错误: 数组长度不足");
+                            let err = "启用集群响应格式错误: 数组长度不足";
+                            error!("{} (期望>=2, 实际={})", err, values.len());
+                            let _ = tx.send(Err(anyhow!(err))).await;
                             return;
                         }
                         
-                        if !values[0].is_null() {
-                            if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
-                                error!("启用集群失败: {}", err_msg);
+                        let err_value = values[0].clone();
+                        if !err_value.is_null() {
+                            if let Some(err_msg) = err_value.get("message").and_then(|v| v.as_str()) {
+                                error!("主控服务器返回错误: {}", err_msg);
+                                let _ = tx.send(Err(anyhow!(err_msg.to_string()))).await;
                                 return;
                             } else {
-                                error!("启用集群失败: {:?}", values[0]);
+                                let err = format!("主控服务器返回未知错误: {:?}", err_value);
+                                error!("{}", err);
+                                let _ = tx.send(Err(anyhow!(err))).await;
                                 return;
                             }
                         }
                         
-                        if values[1].as_bool() != Some(true) {
-                            error!("节点注册失败: 未收到成功确认");
+                        let ack_value = values[1].clone();
+                        if ack_value.as_bool() != Some(true) {
+                            let err = format!("节点注册失败: 服务器未返回成功确认 (返回值: {:?})", ack_value);
+                            error!("{}", err);
+                            let _ = tx.send(Err(anyhow!(err))).await;
                             return;
                         }
                         
-                        {
-                            let mut is_enabled_guard = is_enabled.write().unwrap();
-                            *is_enabled_guard = true;
-                            info!("集群已成功启用");
-                        }
+                        info!("节点注册成功，等待集群启用");
+                        let _ = tx.send(Ok(())).await;
                     },
-                    _ => error!("收到非文本格式的enable响应: {:?}", message),
+                    _ => {
+                        let err = format!("收到非文本格式的enable响应: {:?}", message);
+                        error!("{}", err);
+                        let _ = tx.send(Err(anyhow!(err))).await;
+                    }
                 }
             }.boxed()
         };
         
-        info!("发送启用请求...");
+        info!("正在发送节点注册请求 (超时时间: 300秒)...");
         let res = socket
             .emit_with_ack("enable", payload, Duration::from_secs(300), ack_callback)
             .await;
             
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        
-        if res.is_err() {
-            error!("发送启用请求失败: {:?}", res.err());
-            return Err(anyhow!("发送启用请求失败"));
+        if let Err(e) = res {
+            error!("发送注册请求失败: {:?}", e);
+            return Err(anyhow!("发送注册请求失败: {}", e));
         }
         
-        if !*self.is_enabled.read().unwrap() {
-            return Err(anyhow!("节点注册失败或超时"));
+        // 等待回调处理完成或超时
+        match tokio::time::timeout(Duration::from_secs(300), rx.recv()).await {
+            Ok(Some(Ok(()))) => {
+                {
+                    let mut is_enabled = self.is_enabled.write().unwrap();
+                    *is_enabled = true;
+                }
+                info!("节点注册流程完成，开始工作");
+                // 启动 keepalive
+                // TODO: 实现 keepalive 启动
+                Ok(())
+            },
+            Ok(Some(Err(e))) => {
+                error!("节点注册失败: {}", e);
+                Err(e)
+            },
+            Ok(None) => {
+                error!("回调通道已关闭");
+                Err(anyhow!("节点注册失败: 回调通道已关闭"))
+            },
+            Err(_) => {
+                error!("节点注册超时");
+                Err(anyhow!("节点注册超时"))
+            }
         }
-        
-        Ok(())
     }
     
     pub async fn disable(&self) -> Result<()> {
@@ -1506,8 +1555,17 @@ impl Cluster {
     }
 
     pub async fn port_check(&self) -> Result<()> {
-        let host = self.host.clone().unwrap_or_else(|| "".to_string());
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
         
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
+        
+        let host = self.host.clone().unwrap_or_else(|| "".to_string());
         let byoc = {
             let config = CONFIG.read().unwrap();
             config.byoc
@@ -1529,107 +1587,83 @@ impl Cluster {
             "flavor": flavor,
         });
         
-        let socket_opt = {
-            let socket_guard = self.socket.read().unwrap();
-            socket_guard.clone()
-        };
-        
-        let socket = match socket_opt {
-            Some(socket) => socket,
-            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
-        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         
         let ack_callback = move |message: Payload, _| {
+            let tx = tx.clone();
             async move {
-                info!("收到port-check响应回调");
+                debug!("收到port-check响应回调");
                 match message {
                     Payload::Text(values) => {
-                        info!("处理port-check响应的文本数据: {:?}", values);
+                        debug!("处理port-check响应的文本数据: {:?}", values);
+                        
+                        // 克隆整个values数组
+                        let values = values.to_vec();
+                        
+                        if values.len() < 2 {
+                            let err = "端口检查响应格式错误: 数组长度不足";
+                            error!("{} (期望>=2, 实际={})", err, values.len());
+                            let _ = tx.send(Err(anyhow!(err))).await;
+                            return;
+                        }
+                        
+                        // 克隆第一个元素用于错误检查
+                        let err_value = values[0].clone();
+                        if !err_value.is_null() {
+                            if let Some(err_msg) = err_value.get("message").and_then(|v| v.as_str()) {
+                                let err_msg = err_msg.to_string(); // 克隆字符串
+                                error!("主控服务器返回错误: {}", err_msg);
+                                let _ = tx.send(Err(anyhow!(err_msg))).await;
+                                return;
+                            } else {
+                                let err = format!("主控服务器返回未知错误: {:?}", err_value);
+                                error!("{}", err);
+                                let _ = tx.send(Err(anyhow!(err))).await;
+                                return;
+                            }
+                        }
+                        
+                        info!("端口检查成功");
+                        let _ = tx.send(Ok(())).await;
                     },
-                    _ => error!("收到非文本格式的port-check响应: {:?}", message),
+                    _ => {
+                        let err = format!("收到非文本格式的port-check响应: {:?}", message);
+                        error!("{}", err);
+                        let _ = tx.send(Err(anyhow!(err))).await;
+                    }
                 }
             }.boxed()
         };
         
-        info!("发送端口检查请求...");
+        info!("正在发送端口检查请求...");
         let res = socket
             .emit_with_ack("port-check", payload, Duration::from_secs(10), ack_callback)
             .await;
             
-        if res.is_err() {
-            error!("发送端口检查请求失败: {:?}", res.err());
-            return Err(anyhow!("发送端口检查请求失败"));
+        if let Err(e) = res {
+            error!("发送端口检查请求失败: {:?}", e);
+            return Err(anyhow!("发送端口检查请求失败: {}", e));
         }
         
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        
-        info!("端口检查请求已完成");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn find_public_ip() -> Result<String> {
-        let enable_upnp = {
-            let config = CONFIG.read().unwrap();
-            config.enable_upnp
-        };
-        
-        let (port, public_port) = {
-            let config = CONFIG.read().unwrap();
-            (config.port, config.cluster_public_port)
-        };
-        
-        if enable_upnp {
-            info!("尝试通过UPnP获取公网IP...");
-            match upnp::setup_upnp(port, public_port).await {
-                Ok(ip) => {
-                    info!("成功通过UPnP获取公网IP: {}", ip);
-                    return Ok(ip);
-                },
-                Err(e) => {
-                    warn!("UPnP获取公网IP失败: {}", e);
-                    warn!("将尝试使用在线IP查询服务获取公网IP");
-                }
-            }
-        } else {
-            info!("UPnP功能未启用，将尝试使用在线IP查询服务获取公网IP");
-        }
-        
-        let ip_services = [
-            "https://api.ipify.org",
-            "https://ifconfig.me/ip",
-            "https://icanhazip.com",
-        ];
-        
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-        
-        for service in ip_services {
-            info!("尝试从 {} 获取公网IP...", service);
-            match client.get(service).send().await {
-                            Ok(response) => {
-                                if response.status().is_success() {
-                        if let Ok(ip) = response.text().await {
-                            let ip = ip.trim();
-                            if !ip.is_empty() {
-                                info!("成功从 {} 获取公网IP: {}", service, ip);
-                                return Ok(ip.to_string());
-                            }
-                        }
-                    } else {
-                        warn!("从 {} 获取IP失败，HTTP状态码: {}", service, response.status());
-                    }
-                },
-                Err(e) => {
-                    warn!("从 {} 获取IP失败: {}", service, e);
-                    continue;
-                }
+        // 等待回调处理完成或超时
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
+            Ok(Some(Ok(()))) => {
+                info!("端口检查完成");
+                Ok(())
+            },
+            Ok(Some(Err(e))) => {
+                error!("端口检查失败: {}", e);
+                Err(e)
+            },
+            Ok(None) => {
+                error!("回调通道已关闭");
+                Err(anyhow!("端口检查失败: 回调通道已关闭"))
+            },
+            Err(_) => {
+                error!("端口检查超时");
+                Err(anyhow!("端口检查超时"))
             }
         }
-        
-        error!("无法通过任何方式获取公网IP");
-        Err(anyhow!("无法获取公网IP，请手动在配置中指定CLUSTER_IP"))
     }
 }
 

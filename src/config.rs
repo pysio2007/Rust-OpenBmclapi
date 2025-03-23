@@ -121,7 +121,7 @@ impl Config {
         let debug_log = env::var("DEBUG_LOG").map(|v| v == "true" || v == "1").unwrap_or(false);
         
         let flavor = ConfigFlavor {
-            runtime: format!("Rust/{}", env!("CARGO_PKG_VERSION")),
+            runtime: format!("Rust/{}", "1.85.1"),
             storage: storage.clone(),
         };
         

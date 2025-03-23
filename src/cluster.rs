@@ -50,8 +50,12 @@ impl Cluster {
     pub fn new(version: &str, token_manager: Arc<TokenManager>) -> Result<Self> {
         let config = CONFIG.read().unwrap().clone();
         
+        // 添加调试输出
+        info!("DEBUG: Cluster创建，传入版本号: {}", version);
+        
         // 创建完整的User-Agent字符串
         let user_agent = format!("{}/{}", USER_AGENT, version);
+        info!("DEBUG: Cluster UA: {}", user_agent);
         
         // 创建HTTP客户端
         let client = Client::builder()
@@ -213,14 +217,14 @@ impl Cluster {
                         let cert_file = tmp_dir.join("cert.pem");
                         let key_file = tmp_dir.join("key.pem");
                         
-                        info!("准备保存证书到: {:?}", cert_file);
-                        info!("准备保存密钥到: {:?}", key_file);
+                        debug!("准备保存证书到: {:?}", cert_file);
+                        debug!("准备保存密钥到: {:?}", key_file);
                         
                         // 确保目录存在
                         if let Some(parent) = cert_file.parent() {
                             if !parent.exists() {
                                 match tokio::fs::create_dir_all(parent).await {
-                                    Ok(_) => info!("创建证书目录成功: {:?}", parent),
+                                    Ok(_) => debug!("创建证书目录成功: {:?}", parent),
                                     Err(e) => {
                                         error!("创建证书目录失败: {:?}, 错误: {}", parent, e);
                                         return;
@@ -552,7 +556,7 @@ impl Cluster {
             "version": env!("CARGO_PKG_VERSION"),
         });
         
-        info!("发送的payload: {}", payload);
+        debug!("发送的payload: {}", payload);
         
         // 准备用于持有结果的变量
         let is_enabled = self.is_enabled.clone();
@@ -561,10 +565,10 @@ impl Cluster {
         let ack_callback = move |message: Payload, _| {
             let is_enabled = is_enabled.clone();
             async move {
-                info!("收到enable响应回调");
+                debug!("收到enable响应回调");
                 match message {
                     Payload::Text(values) => {
-                        info!("处理enable响应的文本数据: {:?}", values);
+                        debug!("处理enable响应的文本数据: {:?}", values);
                         
                         if values.len() < 2 {
                             error!("启用集群响应格式错误: 数组长度不足");
@@ -653,10 +657,10 @@ impl Cluster {
         let ack_callback = move |message: Payload, _| {
             let is_enabled = is_enabled.clone();
             async move {
-                info!("收到disable响应回调");
+                debug!("收到disable响应回调");
                 match message {
                     Payload::Text(values) => {
-                        info!("处理disable响应的文本数据: {:?}", values);
+                        debug!("处理disable响应的文本数据: {:?}", values);
                         
                         if values.len() < 2 {
                             error!("禁用集群响应格式错误: 数组长度不足");
@@ -829,7 +833,7 @@ impl Cluster {
                 {
                     let mut socket_guard = self.socket.write().unwrap();
                     *socket_guard = Some(socket.clone());
-                    info!("已将新的Socket.IO连接保存到共享状态");
+                    debug!("已将新的Socket.IO连接保存到共享状态");
                 }
                 
                 // 记录基本连接信息
@@ -1028,6 +1032,11 @@ impl Cluster {
             url = format!("{}?lastModified={}", url, lm);
         }
         
+        // 添加调试输出
+        debug!("DEBUG: 发送请求到: {}", url);
+        debug!("DEBUG: User-Agent: {}", self.user_agent);
+        debug!("DEBUG: 版本号: {}", self.version);
+        
         let token = self.token_manager.get_token().await?;
         
         let response = self.client.get(&url)
@@ -1051,10 +1060,10 @@ impl Cluster {
             let bytes = response.bytes().await?;
             
             let json_bytes = if is_zstd {
-                info!("收到zstd压缩的文件列表，进行解压缩处理...");
+                debug!("收到zstd压缩的文件列表，进行解压缩处理...");
                 match zstd::decode_all(bytes.as_ref()) {
                     Ok(decoded) => {
-                        info!("zstd解压缩成功，解压后大小: {}字节", decoded.len());
+                        debug!("zstd解压缩成功，解压后大小: {}字节", decoded.len());
                         decoded
                     },
                     Err(e) => {
@@ -1063,7 +1072,7 @@ impl Cluster {
                     }
                 }
             } else {
-                info!("收到未压缩的文件列表");
+                debug!("收到未压缩的文件列表");
                 bytes.to_vec()
             };
             

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
-use log::{debug, error, trace};
+use log::{debug, error, trace, info};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -36,12 +36,11 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
-    pub fn new(cluster_id: String, cluster_secret: String, _version: String) -> Self {
+    pub fn new(cluster_id: String, cluster_secret: String, version: String) -> Self {
         let prefix_url = env::var("CLUSTER_BMCLAPI")
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
         
         // 创建完整的User-Agent字符串
-        let version = env!("CARGO_PKG_VERSION");
         let user_agent = format!("{}/{}", USER_AGENT, version);
         
         // 创建HTTP客户端
@@ -75,8 +74,14 @@ impl TokenManager {
     }
 
     async fn fetch_token(&self) -> Result<String> {
+        // 添加调试输出
+        info!("DEBUG: TokenManager版本号: {}", self.version);
+        info!("DEBUG: TokenManager UA: {}", self.user_agent);
+        
         // 1. 请求challenge
         let challenge_url = format!("{}/openbmclapi-agent/challenge", self.prefix_url);
+        info!("DEBUG: 请求challenge URL: {}", challenge_url);
+        
         let response = self.client
             .get(&challenge_url)
             .query(&[("clusterId", &self.cluster_id)])

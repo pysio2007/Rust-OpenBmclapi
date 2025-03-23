@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Result};
 use axum::body::Body;
 use axum::{response::Response, routing::get, Router};
-use axum::extract::{Query, State, Path};
-use axum::http::{StatusCode, Request};
+use axum::extract::{Query, State, Path, Request, connect_info::ConnectInfo};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use axum::middleware;
 use reqwest::Client;
 use serde_json::json;   
 use std::collections::HashMap;
@@ -348,16 +349,75 @@ impl Cluster {
                 return Err(anyhow!("未找到SSL证书，无法启动HTTPS服务器"));
             }
             
+            let (cert_path, key_path) = cert_files.as_ref().unwrap();
+            
+            // 读取证书和密钥
+            let cert = tokio::fs::read(cert_path).await?;
+            let key = tokio::fs::read(key_path).await?;
+            
+            // 配置 TLS
+            let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key)
+                .await
+                .map_err(|e| anyhow!("TLS配置错误: {}", e))?;
+                
             info!("已配置HTTPS服务器，证书就绪");
+            
+            // 启动 HTTPS 服务器
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.port));
+            let router_clone = router.clone();
+            
+            tokio::spawn(async move {
+                let server = axum_server::bind_rustls(addr, config);
+                if let Err(e) = server.serve(router_clone.into_make_service()).await {
+                    error!("HTTPS服务器错误: {}", e);
+                }
+            });
         }
         
         Ok(router)
+    }
+    
+    pub async fn start_server(&self, router: Router, addr: std::net::SocketAddr) -> Result<()> {
+        info!("正在启动HTTP服务器，监听地址: {}", addr);
+        
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!("成功绑定到端口 {}", addr.port());
+        
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+        );
+        
+        info!("HTTP服务器开始运行");
+        server.await?;
+        
+        Ok(())
     }
     
     fn create_router(&self) -> Router {
         let cluster = Arc::new(self.clone());
         
         Router::new()
+            .layer(axum::middleware::from_fn(|req: Request, next: middleware::Next| {
+                async move {
+                    let method = req.method().clone();
+                    let version = format!("{:?}", req.version());
+                    let uri = req.uri().clone();
+                    let remote_addr = req.extensions()
+                        .get::<ConnectInfo<std::net::SocketAddr>>()
+                        .map(|connect_info| connect_info.0)
+                        .unwrap_or_else(|| "未知IP".parse().unwrap());
+                    let user_agent = req.headers()
+                        .get(axum::http::header::USER_AGENT)
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("未知UA");
+                    
+                    info!("收到请求 - IP: {}, 方法: {}, URL: {}, UA: {}, HTTP版本: {}", 
+                        remote_addr, method, uri, user_agent, version);
+                    
+                    next.run(req).await
+                }
+            }))
             .route("/files/:hash_path", get(serve_file))
             .route("/list/directory", get(
                 |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
@@ -609,8 +669,46 @@ impl Cluster {
                     *is_enabled = true;
                 }
                 info!("节点注册流程完成，开始工作");
+                
                 // 启动 keepalive
-                // TODO: 实现 keepalive 启动
+                let cluster = self.clone();
+                tokio::spawn(async move {
+                    info!("启动 keepalive 任务");
+                    
+                    // 发送首次心跳
+                    if let Err(e) = cluster.send_heartbeat().await {
+                        error!("首次发送心跳失败: {}", e);
+                    }
+                    
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    while *cluster.is_enabled.read().unwrap() {
+                        interval.tick().await;
+                        
+                        // 获取当前计数
+                        let current_counter = {
+                            let counters = cluster.counters.read().unwrap();
+                            counters.clone()
+                        };
+                        
+                        
+                        // 发送心跳
+                        match cluster.send_heartbeat().await {
+                            Ok(_) => {
+                                // 成功发送后，减去已上报的计数
+                                let mut counters = cluster.counters.write().unwrap();
+                                counters.hits -= current_counter.hits;
+                                counters.bytes -= current_counter.bytes;
+                                debug!("心跳发送成功，更新计数器 - 当前计数 hits: {}, bytes: {}", 
+                                    counters.hits, counters.bytes);
+                            }
+                            Err(e) => {
+                                error!("发送心跳失败: {}", e);
+                            }
+                        }
+                    }
+                    info!("keepalive 任务结束");
+                });
+                
                 Ok(())
             },
             Ok(Some(Err(e))) => {
@@ -719,6 +817,7 @@ impl Cluster {
             "host": host,
             "port": self.public_port,
             "version": env!("CARGO_PKG_VERSION"),
+            "time": chrono::Utc::now().timestamp_millis(),
         });
         
         let socket_opt = {
@@ -894,7 +993,7 @@ impl Cluster {
                 counters.clone()
             };
             
-            let start_time = chrono::Utc::now().timestamp() * 1000;
+            let start_time = chrono::Utc::now().timestamp_millis();
             let payload = json!({
                 "hits": current_counter.hits,
                 "bytes": current_counter.bytes,

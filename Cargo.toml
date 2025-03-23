@@ -8,6 +8,7 @@ description = "Rust implementation of OpenBMCLAPI"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["multipart"] }
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 hyper = { version = "1.0", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }

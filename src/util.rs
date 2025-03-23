@@ -1,13 +1,15 @@
 use anyhow::{Result, anyhow};
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha1::{Digest as Sha1Digest, Sha1};
 use std::path::Path;
 use std::collections::BTreeMap;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use std::fs;
+use chrono::Utc;
+use log::debug;
 
 // 将哈希值转换为文件名
 pub fn hash_to_filename(hash: &str) -> String {
@@ -15,14 +17,13 @@ pub fn hash_to_filename(hash: &str) -> String {
     Path::new(prefix).join(hash).to_string_lossy().to_string()
 }
 
-// 计算文件的SHA256哈希值
+// 计算文件的SHA1哈希值
 pub async fn calculate_file_hash<P: AsRef<Path>>(path: P) -> Result<String> {
-    let data = tokio::fs::read(path).await?;
-    let mut hasher = Sha256::new();
+    let data = fs::read(path)?;
+    let mut hasher = Sha1::new();
     hasher.update(&data);
     let result = hasher.finalize();
-    
-    Ok(hex::encode(result))
+    Ok(format!("{:x}", result))
 }
 
 #[derive(Debug, Serialize, Deserialize)]

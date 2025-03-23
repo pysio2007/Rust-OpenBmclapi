@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
-use log::{debug, error, trace, info};
+use log::{debug, error, info};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

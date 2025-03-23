@@ -78,14 +78,11 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     info!("HTTP服务器监听于 {}", addr);
     
     // 启动HTTP服务器
-    let listener = TcpListener::bind(&addr).await?;
-    let server = axum::serve(listener, router);
-    
-    // 设置关闭信号
-    let (tx, mut rx) = mpsc::channel(1);
-    let server_with_shutdown = server.with_graceful_shutdown(async move {
-        rx.recv().await;
-        info!("收到关闭信号，服务器即将关闭...");
+    let cluster_clone = cluster.clone();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = cluster_clone.start_server(router, addr).await {
+            error!("HTTP服务器错误: {}", e);
+        }
     });
     
     // 获取文件列表
@@ -126,13 +123,6 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     // 设置文件检查定时器
     let check_file_interval = Duration::from_secs(600); // 10分钟
     let mut last_files = files;
-    
-    // 启动HTTP服务器
-    let _server_handle = tokio::spawn(async move {
-        if let Err(e) = server_with_shutdown.await {
-            error!("HTTP服务器错误: {}", e);
-        }
-    });
     
     // 创建一个任务来定期检查新文件
     let cluster_clone = cluster.clone();
@@ -190,11 +180,13 @@ pub async fn bootstrap(version: &str) -> Result<()> {
                 error!("禁用集群失败: {}", e);
             }
             
-            // 通知服务器关闭
-            let _ = tx.send(()).await;
-            
             // 等待服务器优雅关闭
             tokio::time::sleep(Duration::from_secs(3)).await;
+            
+            // 等待服务器任务完成
+            if let Err(e) = server_handle.await {
+                error!("等待服务器关闭时发生错误: {}", e);
+            }
         },
         Err(e) => {
             error!("无法监听Ctrl+C信号: {}", e);

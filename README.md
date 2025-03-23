@@ -31,6 +31,55 @@ cargo build --release
 
 如果你看到了 `CLUSTER_ID环境变量必须设置` 的报错，说明一切正常，需要设置参数了。
 
+### Docker安装
+
+我们提供了Docker镜像，方便用户快速部署：
+
+```bash
+# 使用官方Docker镜像
+docker run -d \
+  --name rust-bmclapi \
+  -p 4000:4000 \
+  -v $(pwd)/cache:/app/cache \
+  -e CLUSTER_ID=你的CLUSTER_ID \
+  -e CLUSTER_SECRET=你的CLUSTER_SECRET \
+  pysio/rust-openbmclapi:main
+```
+
+参数说明：
+
+- `-p 4000:4000`: 将容器的4000端口映射到主机的4000端口
+- `-v $(pwd)/cache:/app/cache`: 将主机当前目录下的cache文件夹挂载到容器内的/app/cache目录
+- `-e CLUSTER_ID`: 设置集群ID环境变量
+- `-e CLUSTER_SECRET`: 设置集群密钥环境变量
+
+您也可以使用docker-compose:
+
+```yaml
+version: '3'
+services:
+  rust-bmclapi:
+    image: pysio/rust-openbmclapi:main
+    container_name: rust-bmclapi
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./cache:/app/cache
+    environment:
+      - CLUSTER_ID=你的CLUSTER_ID
+      - CLUSTER_SECRET=你的CLUSTER_SECRET
+      # 可选配置
+      # - CLUSTER_PORT=4000
+      # - ENABLE_UPNP=false
+```
+
+将上述内容保存为`docker-compose.yml`文件，然后运行：
+
+```bash
+docker-compose up -d
+```
+
 ### 设置参数
 
 在项目根目录创建一个文件，名为 `.env`
@@ -51,32 +100,32 @@ CLUSTER_ID 和 CLUSTER_SECRET 请联系BMCLAPI管理员获取。
 
 Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过慢。如果您的节点是全量节点，可以通过以下命令使用rsync快速同步（以下rsync服务器相同，选择任意一台）：
 
-* `rsync -rzvP openbmclapi@home.933.moe::openbmclapi cache`
-* `rsync -avP openbmclapi@storage.yserver.ink::bmcl cache`
-* `rsync -azvrhP openbmclapi@openbmclapi.home.mxd.moe::data cache`
+- `rsync -rzvP openbmclapi@home.933.moe::openbmclapi cache`
+- `rsync -avP openbmclapi@storage.yserver.ink::bmcl cache`
+- `rsync -azvrhP openbmclapi@openbmclapi.home.mxd.moe::data cache`
 
 ## 配置说明
 
 主要配置项：
 
-* `CLUSTER_ID`：集群ID，从BMCLAPI获取
-* `CLUSTER_SECRET`：集群密钥，从BMCLAPI获取
-* `CLUSTER_IP`：可选，服务器公网IP，不设置会自动获取
-* `CLUSTER_PORT`：服务监听端口，默认4000
-* `CLUSTER_PUBLIC_PORT`：公网访问端口，默认与CLUSTER_PORT相同
-* `ENABLE_UPNP`：是否启用UPnP自动端口映射，默认false
-* `CLUSTER_STORAGE`：存储类型，支持file（本地文件）和webdav（WebDAV）
+- `CLUSTER_ID`：集群ID，从BMCLAPI获取
+- `CLUSTER_SECRET`：集群密钥，从BMCLAPI获取
+- `CLUSTER_IP`：可选，服务器公网IP，不设置会自动获取
+- `CLUSTER_PORT`：服务监听端口，默认4000
+- `CLUSTER_PUBLIC_PORT`：公网访问端口，默认与CLUSTER_PORT相同
+- `ENABLE_UPNP`：是否启用UPnP自动端口映射，默认false
+- `CLUSTER_STORAGE`：存储类型，支持file（本地文件）和webdav（WebDAV）
 
 详细配置请参考`.env.example`文件。
 
 ## 特性
 
-* 完全兼容原版OpenBMCLAPI协议
-* 高性能的文件服务
-* 支持多种存储后端（本地文件、WebDAV等）
-* 低资源占用
-* 自动UPnP端口映射
-* 支持SSL加密
+- 完全兼容原版OpenBMCLAPI协议
+- 高性能的文件服务
+- 支持多种存储后端（本地文件、WebDAV等）
+- 低资源占用
+- 自动UPnP端口映射
+- 支持SSL加密
 
 ## 贡献
 

@@ -1,21 +1,18 @@
 use anyhow::{Result, anyhow};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as Sha2Digest, Sha256};
 use std::path::Path;
 use std::collections::BTreeMap;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
 // 将哈希值转换为文件名
 pub fn hash_to_filename(hash: &str) -> String {
-    // 在hash的每两个字符之间插入/
-    let mut result = String::new();
-    for (i, c) in hash.chars().enumerate() {
-        if i > 0 && i % 2 == 0 {
-            result.push('/');
-        }
-        result.push(c);
-    }
-    result
+    let prefix = &hash[0..2];
+    Path::new(prefix).join(hash).to_string_lossy().to_string()
 }
 
 // 计算文件的SHA256哈希值
@@ -74,13 +71,39 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// 检查签名
-pub fn check_sign(data: &[u8], sign: &str, secret: &str) -> bool {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.update(secret.as_bytes());
-    let result = hasher.finalize();
-    let computed_sign = hex::encode(result);
+/// 检查签名是否有效（匹配NodeJS版本的checkSign函数）
+pub fn check_sign(hash: &str, secret: &str, query: &HashMap<String, String>) -> bool {
+    // 获取签名和过期时间
+    let sign = match query.get("s") {
+        Some(s) => s,
+        None => return false,
+    };
     
-    sign == computed_sign
+    let expire = match query.get("e") {
+        Some(e) => e,
+        None => return false,
+    };
+    
+    // 计算签名
+    let mut hasher = Sha1::new();
+    hasher.update(secret.as_bytes());
+    hasher.update(hash.as_bytes());
+    hasher.update(expire.as_bytes());
+    let digest = hasher.finalize();
+    
+    // Base64 URL Safe 编码
+    let calculated_sign = URL_SAFE_NO_PAD.encode(digest);
+    
+    // 检查签名是否匹配，并且是否过期
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("获取系统时间失败")
+        .as_millis();
+        
+    let expire_time = match i64::from_str_radix(expire, 36) {
+        Ok(time) => time as u128,
+        Err(_) => return false,
+    };
+    
+    sign == &calculated_sign && now < expire_time
 } 

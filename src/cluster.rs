@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::config::CONFIG;
-use crate::openapi::OpenbmclapiAgentConfiguration;
+use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
 use crate::storage::Storage;
 use crate::storage::get_storage;
 use crate::token::TokenManager;
@@ -76,6 +76,31 @@ impl Cluster {
     
     pub async fn init(&self) -> Result<()> {
         self.storage.init().await?;
+        
+        // 处理UPnP端口映射
+        let config = CONFIG.read().unwrap().clone();
+        if config.enable_upnp {
+            match upnp::setup_upnp(config.port, config.cluster_public_port).await {
+                Ok(ip) => {
+                    // 检查IP是否为公网IP
+                    if upnp::is_public_ip(&ip) {
+                        info!("UPnP端口映射成功，外网IP: {}", ip);
+                        
+                        // 如果未指定集群IP，则使用UPnP获取的IP
+                        if self.host.is_none() {
+                            let mut config = CONFIG.write().unwrap();
+                            config.cluster_ip = Some(ip);
+                        }
+                    } else {
+                        warn!("UPnP返回的IP不是公网IP: {}", ip);
+                    }
+                },
+                Err(e) => {
+                    warn!("UPnP端口映射失败: {}", e);
+                }
+            }
+        }
+        
         Ok(())
     }
     
@@ -218,7 +243,15 @@ impl Cluster {
                     
                     // 计算验证数据
                     let verify_path = format!("/list/directory?path={}", path);
-                    if !crate::util::check_sign(verify_path.as_bytes(), sign.unwrap(), &cluster_secret) {
+                    
+                    // 构建查询参数
+                    let mut query_map = HashMap::new();
+                    query_map.insert("s".to_string(), sign.unwrap().to_string());
+                    if let Some(e) = params.get("e") {
+                        query_map.insert("e".to_string(), e.to_string());
+                    }
+                    
+                    if !crate::util::check_sign(&verify_path, &cluster_secret, &query_map) {
                         return Response::builder()
                             .status(StatusCode::FORBIDDEN)
                             .body(Body::from("Invalid signature"))
@@ -287,7 +320,15 @@ impl Cluster {
                     
                     // 计算验证数据
                     let path = "/metrics";
-                    if !crate::util::check_sign(path.as_bytes(), sign.unwrap(), &cluster_secret) {
+                    
+                    // 构建查询参数
+                    let mut query_map = HashMap::new();
+                    query_map.insert("s".to_string(), sign.unwrap().to_string());
+                    if let Some(e) = params.get("e") {
+                        query_map.insert("e".to_string(), e.to_string());
+                    }
+                    
+                    if !crate::util::check_sign(path, &cluster_secret, &query_map) {
                         return Response::builder()
                             .status(StatusCode::FORBIDDEN)
                             .body(Body::from("Invalid signature"))
@@ -473,7 +514,31 @@ impl Cluster {
             .await?;
             
         if response.status().is_success() {
-            let config = response.json::<OpenbmclapiAgentConfiguration>().await?;
+            let json_value = response.json::<serde_json::Value>().await?;
+            
+            // 构造OpenbmclapiAgentConfiguration结构
+            let remote_url = json_value["remote_url"].as_str()
+                .ok_or_else(|| anyhow!("配置中缺少remote_url字段"))?
+                .to_string();
+                
+            let source = json_value["sync"]["source"].as_str()
+                .ok_or_else(|| anyhow!("配置中缺少sync.source字段"))?
+                .to_string();
+                
+            let concurrency = json_value["sync"]["concurrency"].as_u64()
+                .ok_or_else(|| anyhow!("配置中缺少sync.concurrency字段"))?
+                as usize;
+                
+            let sync_config = SyncConfig {
+                source,
+                concurrency,
+            };
+            
+            let config = OpenbmclapiAgentConfiguration {
+                sync: sync_config,
+                remote_url,
+            };
+            
             Ok(config)
         } else {
             let status = response.status();
@@ -503,7 +568,7 @@ impl Cluster {
         let token = self.token_manager.get_token().await?;
         
         // 并发下载文件
-        let concurrency = 5; // 默认并发数
+        let concurrency = sync_config.sync.concurrency.max(1); // 确保并发数至少为1
         let source = &sync_config.remote_url;
         
         use futures::stream::{self, StreamExt};
@@ -630,12 +695,21 @@ async fn serve_file(
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
+    // 从路径中提取哈希值
+    let hash = hash_path.split('/').last().unwrap_or(&hash_path).to_string();
+    
     // 创建一个空的字节请求
     let empty_req = Request::new(&[] as &[u8]);
     
     // 请求处理
     match storage.as_ref().handle_bytes_request(&hash_path, empty_req).await {
-        Ok(response) => {
+        Ok(mut response) => {
+            // 添加x-bmclapi-hash响应头
+            let headers = response.headers_mut();
+            if let Ok(header_value) = axum::http::HeaderValue::from_str(&hash) {
+                headers.insert("x-bmclapi-hash", header_value);
+            }
+            
             // 获取文件大小并更新计数器
             if let Some(content_length) = response.headers().get(axum::http::header::CONTENT_LENGTH) {
                 if let Ok(size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
@@ -735,7 +809,9 @@ async fn measure_handler(
     
     // 计算验证数据
     let path = format!("/measure/{}", size);
-    if !crate::util::check_sign(path.as_bytes(), sign.unwrap(), &config.cluster_secret) {
+    
+    // 构建查询参数，确保包含必要的参数
+    if !crate::util::check_sign(&path, &config.cluster_secret, &query_dict) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(Body::from("Invalid signature"))
@@ -795,26 +871,16 @@ async fn auth_handler(req: Request<Body>) -> impl IntoResponse {
     let path = url.path();
     let hash = path.split('/').last().unwrap_or("");
     
-    // 从查询参数中获取sign
+    // 从查询参数中获取sign和过期时间
     let query_params: HashMap<String, String> = url.query_pairs()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    
-    let sign = match query_params.get("sign") {
-        Some(s) => s,
-        None => {
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from("Missing signature"))
-                .unwrap();
-        }
-    };
     
     // 获取配置
     let config = CONFIG.read().unwrap();
     
     // 验证签名
-    if !crate::util::check_sign(hash.as_bytes(), sign, &config.cluster_secret) {
+    if !crate::util::check_sign(hash, &config.cluster_secret, &query_params) {
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(Body::from("Invalid signature"))

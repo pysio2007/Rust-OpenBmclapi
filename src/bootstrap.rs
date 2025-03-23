@@ -15,6 +15,7 @@ use crate::constants::DEFAULT_KEEPALIVE_INTERVAL;
 use crate::keepalive::Keepalive;
 use crate::token::TokenManager;
 use crate::types::FileList;
+use crate::openapi;
 
 pub async fn bootstrap(version: &str) -> Result<()> {
     // 打印启动信息
@@ -59,7 +60,11 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     }
     
     // 创建HTTP服务器
-    let router = cluster.setup_server_with_https(proto == "https").await?;
+    let mut router = cluster.setup_server_with_https(proto == "https").await?;
+    
+    // 添加API路由
+    let api_router = openapi::create_router();
+    router = router.merge(api_router);
     
     // 构建地址
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -112,6 +117,13 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     let check_file_interval = Duration::from_secs(600); // 10分钟
     let mut last_files = files;
     
+    // 启动HTTP服务器
+    let _server_handle = tokio::spawn(async move {
+        if let Err(e) = server_with_shutdown.await {
+            error!("HTTP服务器错误: {}", e);
+        }
+    });
+    
     // 创建一个任务来定期检查新文件
     let cluster_clone = cluster.clone();
     tokio::spawn(async move {
@@ -135,32 +147,26 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     });
     
     // 处理终止信号
-    tokio::spawn(async move {
-        match signal::ctrl_c().await {
-            Ok(()) => {
-                info!("收到终止信号，开始关闭服务...");
-                
-                // 禁用集群
-                if let Err(e) = cluster.disable().await {
-                    error!("禁用集群失败: {}", e);
-                }
-                
-                // 通知服务器关闭
-                let _ = tx.send(()).await;
-            },
-            Err(e) => {
-                error!("无法监听Ctrl+C信号: {}", e);
+    match signal::ctrl_c().await {
+        Ok(()) => {
+            info!("收到终止信号，开始关闭服务...");
+            
+            // 禁用集群
+            if let Err(e) = cluster.disable().await {
+                error!("禁用集群失败: {}", e);
             }
+            
+            // 通知服务器关闭
+            let _ = tx.send(()).await;
+            
+            // 等待服务器优雅关闭
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        },
+        Err(e) => {
+            error!("无法监听Ctrl+C信号: {}", e);
         }
-    });
-    
-    // 等待服务器关闭
-    if let Err(e) = server_with_shutdown.await {
-        error!("服务器错误: {}", e);
-        return Err(anyhow!("服务器错误: {}", e));
     }
     
-    info!("服务已关闭");
     Ok(())
 }
 

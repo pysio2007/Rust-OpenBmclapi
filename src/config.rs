@@ -32,7 +32,6 @@ pub struct Config {
     pub ssl_cert: Option<String>,
     
     // 功能开关
-    pub enable_nginx: bool,
     pub enable_upnp: bool,
     pub enable_metrics: bool,
     
@@ -58,7 +57,6 @@ impl Config {
         let byoc = env::var("CLUSTER_BYOC").map(|v| v == "true" || v == "1").unwrap_or(false);
         let disable_access_log = env::var("DISABLE_ACCESS_LOG").map(|v| v == "true" || v == "1").unwrap_or(false);
         
-        let enable_nginx = env::var("ENABLE_NGINX").map(|v| v == "true" || v == "1").unwrap_or(false);
         let enable_upnp = env::var("ENABLE_UPNP").map(|v| v == "true" || v == "1").unwrap_or(false);
         let enable_metrics = env::var("ENABLE_METRICS").map(|v| v == "true" || v == "1").unwrap_or(false);
         
@@ -86,7 +84,6 @@ impl Config {
             cluster_public_port,
             byoc,
             disable_access_log,
-            enable_nginx,
             enable_upnp,
             enable_metrics,
             storage,
@@ -110,6 +107,7 @@ lazy_static! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenbmclapiAgentConfiguration {
     pub sync: SyncConfig,
+    pub remote_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

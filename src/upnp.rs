@@ -164,6 +164,14 @@ fn is_private_ip(ip: &Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast()
 }
 
+// 判断IP是否是公网IP
+pub fn is_public_ip(ip: &str) -> bool {
+    if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+        return !is_private_ip(&ip);
+    }
+    false
+}
+
 // 获取本地IP地址
 fn get_local_ip() -> Result<Ipv4Addr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;

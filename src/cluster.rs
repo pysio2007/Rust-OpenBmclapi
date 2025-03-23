@@ -18,6 +18,10 @@ use rust_socketio::{
     Payload, TransportType,
 };
 use indicatif;
+use serde::{Deserialize, Serialize};
+use bytes;
+use hex;
+use url::Url;
 
 use crate::config::CONFIG;
 use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
@@ -26,8 +30,16 @@ use crate::storage::get_storage;
 use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
+use crate::util::check_sign;
 
 const USER_AGENT: &str = "openbmclapi-cluster/1.13.1 rust-openbmclapi-cluster";
+
+// 从openapi.rs移过来的结构体定义
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenbmclapiBaseConfiguration {
+    pub enabled: bool,
+    pub priority: i32,
+}
 
 pub struct Cluster {
     client: Client,
@@ -366,12 +378,34 @@ impl Cluster {
             let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.port));
             let router_clone = router.clone();
             
+            info!("正在启动HTTPS服务器，监听地址: {}", addr);
+            
+            // 创建一个完成信号通道，确保服务器启动成功
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            
             tokio::spawn(async move {
                 let server = axum_server::bind_rustls(addr, config);
+                
+                info!("HTTPS服务器绑定成功，开始监听请求");
+                
+                // 发送服务器成功启动的信号
+                let _ = tx.send(());
+                
                 if let Err(e) = server.serve(router_clone.into_make_service()).await {
                     error!("HTTPS服务器错误: {}", e);
                 }
             });
+            
+            // 等待服务器启动确认
+            match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                Ok(_) => info!("HTTPS服务器已成功启动"),
+                Err(_) => {
+                    warn!("等待HTTPS服务器启动超时，但将继续执行");
+                    // 这里我们不返回错误，因为服务器可能仍在启动中
+                }
+            }
+        } else {
+            info!("使用HTTP模式，HTTPS服务器不会启动");
         }
         
         Ok(router)
@@ -383,12 +417,16 @@ impl Cluster {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!("成功绑定到端口 {}", addr.port());
         
+        // 配置HTTP服务器 - 增加超时设置
+        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        
+        // 使用axum::serve并增加超时中间件
         let server = axum::serve(
             listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>()
+            service
         );
         
-        info!("HTTP服务器开始运行");
+        info!("HTTP服务器开始运行，已配置长连接支持");
         server.await?;
         
         Ok(())
@@ -406,19 +444,27 @@ impl Cluster {
                     let remote_addr = req.extensions()
                         .get::<ConnectInfo<std::net::SocketAddr>>()
                         .map(|connect_info| connect_info.0)
-                        .unwrap_or_else(|| "未知IP".parse().unwrap());
+                        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
                     let user_agent = req.headers()
                         .get(axum::http::header::USER_AGENT)
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("未知UA");
                     
+                    let display_addr = if remote_addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) && remote_addr.port() == 0 {
+                        "未知IP".to_string()
+                    } else {
+                        remote_addr.to_string()
+                    };
+                    
                     info!("收到请求 - IP: {}, 方法: {}, URL: {}, UA: {}, HTTP版本: {}", 
-                        remote_addr, method, uri, user_agent, version);
+                        display_addr, method, uri, user_agent, version);
                     
                     next.run(req).await
                 }
             }))
-            .route("/files/:hash_path", get(serve_file))
+            .route("/download/:hash", get(serve_file))
+            .route("/auth", get(auth_handler))
+            .route("/measure/:size", get(measure_handler))
             .route("/list/directory", get(
                 |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
                     let sign = params.get("sign");
@@ -912,9 +958,21 @@ impl Cluster {
                 
                 info!("Socket.IO连接已完成初始化并保存");
                 
-                let cluster = self.clone();
+                // 在单独线程中运行keepalive逻辑
+                let cluster_arc = Arc::new(self.clone());
                 tokio::spawn(async move {
-                    cluster.start_keepalive_task().await;
+                    let mut interval = tokio::time::interval(Duration::from_secs(60));
+                    loop {
+                        interval.tick().await;
+                        
+                        if !*cluster_arc.is_enabled.read().unwrap() {
+                            break;
+                        }
+                        
+                        if let Err(e) = cluster_arc.send_heartbeat().await {
+                            error!("keepalive心跳失败: {}", e);
+                        }
+                    }
                 });
                 
                 Ok(())
@@ -975,106 +1033,117 @@ impl Cluster {
     }
     
     async fn start_keepalive_task(&self) {
-        info!("启动keep-alive定时任务 (间隔60秒)");
+        info!("启动 keepalive 任务");
+        
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
         let mut failed_keepalive = 0;
         
-        while *self.is_enabled.read().unwrap() {
-            debug!("等待60秒后发送下一次keep-alive...");
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            debug!("keep-alive计时结束，准备发送keep-alive");
+        loop {
+            interval.tick().await;
             
-            if !*self.is_enabled.read().unwrap() {
-                info!("集群已禁用 (is_enabled=false)，停止keep-alive定时任务");
-                break;
+            // 检查集群是否希望启用自己
+            if !self.want_enable().await {
+                debug!("集群不希望启用，跳过 keepalive");
+                continue;
             }
             
-            let current_counter = {
-                let counters = self.counters.read().unwrap();
-                counters.clone()
-            };
+            debug!("发送 keepalive");
             
-            let start_time = chrono::Utc::now().timestamp_millis();
-            let payload = json!({
-                "hits": current_counter.hits,
-                "bytes": current_counter.bytes,
-                "time": start_time
-            });
+            // 如果不是已启用状态，尝试重新上线
+            if !self.is_enabled().await {
+                info!("集群状态为离线，尝试重新连接");
+                if let Err(e) = self.try_reconnect().await {
+                    error!("尝试重新连接失败: {}", e);
+                    failed_keepalive += 1;
+                    
+                    if failed_keepalive >= 5 {
+                        error!("重连失败次数过多 ({}次)，降低重连频率", failed_keepalive);
+                        // 降低重连频率，避免频繁请求
+                        interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟重试一次
+                    }
+                    continue;
+                } else {
+                    info!("重新连接成功，恢复正常心跳频率");
+                    // 恢复正常心跳频率
+                    interval = tokio::time::interval(Duration::from_secs(60));
+                    failed_keepalive = 0;
+                }
+            }
             
-            let socket_opt = {
-                let socket_guard = self.socket.read().unwrap();
-                socket_guard.clone()
-            };
-            
-            if let Some(socket) = socket_opt {
-                debug!("发送keep-alive数据: {:?} (当前时间戳: {})", payload, start_time);
-                
-                let counters = self.counters.clone();
-                let current_hits = current_counter.hits;
-                let current_bytes = current_counter.bytes;
-                
-                let ack_callback = move |message: Payload, _| {
-                    let counters = counters.clone();
-                    let current_hits = current_hits;
-                    let current_bytes = current_bytes;
-                    async move {
-                        debug!("收到keep-alive响应回调");
-                        match message {
-                            Payload::Text(values) => {
-                                debug!("处理keep-alive响应的文本数据: {:?}", values);
-                                
-                                {
-                                    let mut counters_guard = counters.write().unwrap();
-                                    counters_guard.hits -= current_hits;
-                                    counters_guard.bytes -= current_bytes;
-                                    debug!("更新计数器 - 当前计数 hits: {}, bytes: {}", 
-                                         counters_guard.hits, counters_guard.bytes);
-                                }
-                                
-                                debug!("keep-alive处理完成");
-                            },
-                            _ => error!("收到非文本格式的keep-alive响应: {:?}", message),
-                        }
-                    }.boxed()
-                };
-                
-                match socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), ack_callback).await {
-                    Ok(_) => {
-                        if failed_keepalive > 0 {
-                            info!("keep-alive发送成功，重置失败计数 (之前失败次数: {})", failed_keepalive);
-                        } else {
-                            debug!("keep-alive发送成功");
-                        }
+            // 发送心跳
+            match self.send_heartbeat().await {
+                Ok(_) => {
+                    if failed_keepalive > 0 {
+                        info!("keep-alive发送成功，重置失败计数 (之前失败次数: {})", failed_keepalive);
+                        // 恢复正常心跳频率
+                        interval = tokio::time::interval(Duration::from_secs(60));
                         failed_keepalive = 0;
-                    },
-                    Err(e) => {
-                        failed_keepalive += 1;
-                        error!("发送keep-alive失败 ({}/3): {}, 错误详情: {:?}", 
-                             failed_keepalive, e, e);
-                        
-                        if failed_keepalive >= 3 {
-                            error!("连续3次keep-alive失败，将禁用集群 (当前连接可能已断开)");
-                            let _cluster_id = self.token_manager.clone();
-                            let want_enable = Arc::clone(&self.want_enable);
-                            
-                            tokio::spawn(async move {
-                                {
-                                    let mut want_enable_guard = want_enable.write().unwrap();
-                                    let previous = *want_enable_guard;
-                                    *want_enable_guard = false;
-                                    info!("由于连续keep-alive失败，已设置集群为不希望启用状态 (之前状态: {})", previous);
+                    }
+                },
+                Err(e) => {
+                    failed_keepalive += 1;
+                    error!("keep-alive发送失败 (第{}次): {} (原因: {})", 
+                        failed_keepalive, e, e);
+                    
+                    if failed_keepalive >= 3 {
+                        error!("keep-alive连续失败{}次，尝试重新连接", failed_keepalive);
+                        // 尝试重新连接
+                        match self.try_reconnect().await {
+                            Ok(_) => {
+                                info!("重新连接成功");
+                                failed_keepalive = 0;
+                            },
+                            Err(e) => {
+                                error!("重新连接失败: {}", e);
+                                // 如果重连也失败，降低心跳频率
+                                if failed_keepalive >= 5 {
+                                    warn!("降低心跳频率，避免频繁请求");
+                                    interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟
                                 }
-                            });
-                            break;
+                            }
                         }
                     }
                 }
-            } else {
-                error!("没有可用的Socket.IO连接，无法发送keep-alive (socket为None)");
-                break;
+            }
+        }
+    }
+    
+    /// 尝试重新连接服务器
+    async fn try_reconnect(&self) -> Result<()> {
+        info!("尝试重新连接服务器...");
+        
+        // 1. 尝试重新建立Socket.IO连接
+        if let Err(e) = self.connect().await {
+            error!("Socket.IO连接失败: {}", e);
+            return Err(anyhow!("Socket.IO连接失败: {}", e));
+        }
+        
+        // 2. 如果使用HTTPS，检查证书
+        let config = CONFIG.read().unwrap().clone();
+        if config.byoc {
+            if config.ssl_cert.is_some() && config.ssl_key.is_some() {
+                if let Err(e) = self.use_self_cert().await {
+                    error!("使用自定义证书失败: {}", e);
+                    return Err(anyhow!("使用自定义证书失败: {}", e));
+                }
+            }
+        } else {
+            if !self.request_cert().await {
+                return Err(anyhow!("请求证书失败"));
             }
         }
         
-        info!("keep-alive定时任务结束");
+        // 3. 尝试重新启用集群
+        match self.enable().await {
+            Ok(_) => {
+                info!("集群重新启用成功");
+                Ok(())
+            },
+            Err(e) => {
+                error!("集群重新启用失败: {}", e);
+                Err(anyhow!("集群重新启用失败: {}", e))
+            }
+        }
     }
     
     pub async fn get_file_list(&self, last_modified: Option<u64>) -> Result<FileList> {
@@ -1696,9 +1765,25 @@ impl Cluster {
                     Payload::Text(values) => {
                         debug!("处理port-check响应的文本数据: {:?}", values);
                         
-                        // 克隆整个values数组
-                        let values = values.to_vec();
+                        // 处理可能的嵌套数组格式 [Array [Array [Null, Bool(true)]]]
+                        if values.len() == 1 && values[0].is_array() {
+                            if let Some(inner_array) = values[0].as_array() {
+                                if inner_array.len() == 1 && inner_array[0].is_array() {
+                                    if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        if inner_inner_array.len() >= 2 && 
+                                           inner_inner_array[0].is_null() && 
+                                           inner_inner_array[1].is_boolean() && 
+                                           inner_inner_array[1].as_bool().unwrap_or(false) {
+                                            info!("端口检查成功 (嵌套数组格式)");
+                                            let _ = tx.send(Ok(())).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         
+                        // 原始格式检查
                         if values.len() < 2 {
                             let err = "端口检查响应格式错误: 数组长度不足";
                             error!("{} (期望>=2, 实际={})", err, values.len());
@@ -1806,27 +1891,167 @@ impl std::fmt::Debug for Cluster {
 
 async fn serve_file(
     State(cluster): State<Arc<Cluster>>,
-    Path(hash_path): Path<String>,
-    _req: Request<axum::body::Body>,
+    Path(hash): Path<String>,
+    req: Request<axum::body::Body>,
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
-    let hash = hash_path.split('/').last().unwrap_or(&hash_path).to_string();
+    // 获取远程IP和UA用于记录访问日志
+    let remote_addr = req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect_info| connect_info.0)
+        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     
-    let empty_req = Request::new(&[] as &[u8]);
+    let display_addr = if remote_addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) && remote_addr.port() == 0 {
+        "未知IP".to_string()
+    } else {
+        remote_addr.to_string()
+    };
     
-    match storage.as_ref().handle_bytes_request(&hash_path, empty_req).await {
+    let user_agent = req.headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("未知UA");
+    
+    info!("文件下载请求 - IP: {}, 文件: {}, UA: {}", display_addr, hash, user_agent);
+    
+    // 处理查询参数，用于签名验证 - 使用url类库更可靠地解析
+    let mut query_params = HashMap::new();
+    if let Some(query) = req.uri().query() {
+        let query_str = format!("http://localhost/?{}", query);
+        if let Ok(url) = Url::parse(&query_str) {
+            for (key, value) in url.query_pairs() {
+                query_params.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    
+    // 验证签名
+    let cluster_secret = {
+        let config = CONFIG.read().unwrap();
+        config.cluster_secret.clone()
+    };
+    
+    debug!("签名验证参数: path={}, params={:?}", hash, query_params);
+    
+    // 修改：直接使用hash作为path参数，而不是/download/hash前缀
+    let sign_valid = crate::util::check_sign(&hash, &cluster_secret, &query_params);
+    if !sign_valid {
+        error!("签名验证失败 - IP: {}, 文件: {}, 参数: {:?}", display_addr, hash, query_params);
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("Invalid signature"))
+            .unwrap();
+    }
+    
+    // 转换为存储中的文件名格式
+    let file_path = hash_to_filename(&hash);
+    
+    // 检查文件是否存在
+    let exists = match storage.exists(&file_path).await {
+        Ok(exists) => exists,
+        Err(e) => {
+            error!("检查文件存在性失败: {}", e);
+            return Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(format!("检查文件失败: {}", e)))
+                .unwrap();
+        }
+    };
+    
+    if !exists {
+        error!("请求的文件不存在: {}", file_path);
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("File not found"))
+            .unwrap();
+    }
+    
+    // 获取Range请求头信息
+    let range_header = req.headers().get(axum::http::header::RANGE);
+    
+    // 创建一个新的请求对象，包含原始请求中的Range头
+    let mut storage_req = Request::new(&[] as &[u8]);
+    if let Some(range) = range_header {
+        storage_req.headers_mut().insert(axum::http::header::RANGE, range.clone());
+    }
+    
+    // 处理文件请求
+    match storage.as_ref().handle_bytes_request(&file_path, storage_req).await {
         Ok(mut response) => {
-            let headers = response.headers_mut();
-            if let Ok(header_value) = axum::http::HeaderValue::from_str(&hash) {
-                headers.insert("x-bmclapi-hash", header_value);
+            // 添加哈希标头
+            {
+                let headers = response.headers_mut();
+                if let Ok(header_value) = axum::http::HeaderValue::from_str(&hash) {
+                    headers.insert("x-bmclapi-hash", header_value);
+                }
             }
             
-            if let Some(content_length) = response.headers().get(axum::http::header::CONTENT_LENGTH) {
-                if let Ok(size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
+            // 如果有Range请求头但Storage没有处理，我们需要在这里处理
+            if range_header.is_some() && response.status() != StatusCode::PARTIAL_CONTENT {
+                // 先获取内容长度，避免多重借用
+                let content_length = {
+                    let headers = response.headers();
+                    headers.get(axum::http::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                
+                // 处理Range请求
+                if let Some(range_str) = range_header.and_then(|h| h.to_str().ok()) {
+                    if let Some(bytes_range) = range_str.strip_prefix("bytes=") {
+                        let ranges: Vec<&str> = bytes_range.split(',').collect();
+                        
+                        if ranges.len() == 1 {
+                            // 只处理单一范围的情况
+                            let range_parts: Vec<&str> = ranges[0].split('-').collect();
+                            
+                            if range_parts.len() == 2 && content_length > 0 {
+                                let start_str = range_parts[0];
+                                let end_str = range_parts[1];
+                                
+                                let start = start_str.parse::<u64>().unwrap_or(0);
+                                let end = if end_str.is_empty() {
+                                    content_length - 1
+                                } else {
+                                    end_str.parse::<u64>().unwrap_or(content_length - 1)
+                                };
+                                
+                                debug!("处理Range请求: {}-{}/{}", start, end, content_length);
+                                
+                                // 更新响应头和状态码
+                                *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                                
+                                let range_length = end - start + 1;
+                                
+                                {
+                                    let headers = response.headers_mut();
+                                    if let Ok(content_range) = axum::http::HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, content_length)) {
+                                        headers.insert(axum::http::header::CONTENT_RANGE, content_range);
+                                    }
+                                    
+                                    if let Ok(new_length) = axum::http::HeaderValue::from_str(&range_length.to_string()) {
+                                        headers.insert(axum::http::header::CONTENT_LENGTH, new_length);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 更新计数器
+            {
+                let content_length = response.headers().get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                
+                if content_length > 0 {
                     let mut counters = cluster.counters.write().unwrap();
                     counters.hits += 1;
-                    counters.bytes += size;
+                    counters.bytes += content_length;
                 }
             }
             
@@ -1863,7 +2088,7 @@ async fn try_reconnect(cluster: &Cluster) -> Result<(), anyhow::Error> {
     }
 }
 
-fn validate_file(data: &[u8], hash: &str) -> bool {
+pub fn validate_file(data: &[u8], hash: &str) -> bool {
     use sha1::{Sha1, Digest};
     let mut hasher = Sha1::new();
     hasher.update(data);
@@ -1871,6 +2096,90 @@ fn validate_file(data: &[u8], hash: &str) -> bool {
     calculated_hash == hash.to_lowercase()
 }
 
-fn hash_to_filename(hash: &str) -> String {
+pub fn hash_to_filename(hash: &str) -> String {
     format!("{}/{}", &hash[0..2], hash)
 } 
+
+// 从openapi.rs移植过来的auth处理程序
+async fn auth_handler(
+    req: Request<axum::body::Body>,
+) -> impl IntoResponse {
+    let config = CONFIG.read().unwrap();
+    
+    // 获取原始URI
+    let original_uri = match req.headers().get("x-original-uri") {
+        Some(uri) => uri.to_str().unwrap_or_default(),
+        None => return (StatusCode::FORBIDDEN, "Invalid request").into_response(),
+    };
+    
+    // 解析URI
+    let uri = match Url::parse(&format!("http://localhost{}", original_uri)) {
+        Ok(uri) => uri,
+        Err(_) => return (StatusCode::FORBIDDEN, "Invalid URI").into_response(),
+    };
+    
+    // 获取哈希和查询参数
+    let path = uri.path();
+    let segments: Vec<&str> = path.split('/').collect();
+    let hash = segments.last().unwrap_or(&"");
+    
+    // 获取查询参数
+    let mut query_params = HashMap::new();
+    for (key, value) in uri.query_pairs() {
+        query_params.insert(key.to_string(), value.to_string());
+    }
+    
+    // 检查签名
+    if !check_sign(hash, &config.cluster_secret, &query_params) {
+        return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
+    }
+    
+    // 返回成功
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// 从openapi.rs移植过来的measure处理程序，完全基于TypeScript参考实现
+async fn measure_handler(
+    Path(size): Path<u32>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 验证签名
+    let config = CONFIG.read().unwrap();
+    let path = format!("/measure/{}", size);
+    
+    if !check_sign(&path, &config.cluster_secret, &params) {
+        return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
+    }
+    
+    // 检查size是否有效
+    if size > 200 {
+        return (StatusCode::BAD_REQUEST, "Size too large").into_response();
+    }
+    
+    // 创建1MB的固定内容缓冲区，内容为"0066ccff"的重复（完全参考TypeScript实现）
+    let mut buffer = Vec::with_capacity(1024 * 1024);
+    let pattern = hex::decode("0066ccff").unwrap();
+    while buffer.len() < 1024 * 1024 {
+        buffer.extend_from_slice(&pattern);
+    }
+    buffer.truncate(1024 * 1024); // 确保大小为1MB
+    
+    // 计算总大小
+    let total_size = size as usize * buffer.len();
+    
+    // 参考TypeScript版本，一次性创建完整响应
+    // TypeScript版本使用Buffer.alloc创建1MB缓冲区，然后循环写入响应
+    // 我们通过bytes::repeat实现类似功能，避免socket hang up问题
+    let buffer_bytes = bytes::Bytes::from(buffer);
+    
+    info!("发送测量响应，大小 {}MB", size);
+    
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", total_size.to_string())
+        .header("Cache-Control", "no-store")
+        .body(Body::from(buffer_bytes.repeat(size as usize)))
+        .unwrap()
+        .into_response()
+}

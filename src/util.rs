@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::fs;
-use chrono::Utc;
-use log::debug;
+use log;
 
 // 将哈希值转换为文件名
 pub fn hash_to_filename(hash: &str) -> String {
@@ -73,7 +72,7 @@ pub fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 /// 检查签名是否有效（匹配NodeJS版本的checkSign函数）
-pub fn check_sign(hash: &str, secret: &str, query: &HashMap<String, String>) -> bool {
+pub fn check_sign(path: &str, secret: &str, query: &HashMap<String, String>) -> bool {
     // 获取签名和过期时间
     let sign = match query.get("s") {
         Some(s) => s,
@@ -85,15 +84,29 @@ pub fn check_sign(hash: &str, secret: &str, query: &HashMap<String, String>) -> 
         None => return false,
     };
     
+    // 处理路径 - 确保与TS版本一致
+    // TypeScript版本直接使用hash作为路径参数，不带前缀
+    let actual_path = if path.starts_with("/download/") {
+        // 如果传入的是带/download/前缀的路径，提取出hash
+        path.strip_prefix("/download/").unwrap_or(path)
+    } else {
+        // 已经是hash或其他格式的路径
+        path
+    };
+    
+    log::debug!("计算签名: secret={}, path={}, expire={}", secret, actual_path, expire);
+    
     // 计算签名
     let mut hasher = Sha1::new();
     hasher.update(secret.as_bytes());
-    hasher.update(hash.as_bytes());
+    hasher.update(actual_path.as_bytes());
     hasher.update(expire.as_bytes());
     let digest = hasher.finalize();
     
     // Base64 URL Safe 编码
     let calculated_sign = URL_SAFE_NO_PAD.encode(digest);
+    
+    log::debug!("签名比较: 计算值={}, 请求值={}", calculated_sign, sign);
     
     // 检查签名是否匹配，并且是否过期
     let now = SystemTime::now()
@@ -106,5 +119,11 @@ pub fn check_sign(hash: &str, secret: &str, query: &HashMap<String, String>) -> 
         Err(_) => return false,
     };
     
-    sign == &calculated_sign && now < expire_time
+    let sign_match = sign == &calculated_sign;
+    let not_expired = now < expire_time;
+    
+    log::debug!("签名验证结果: 签名匹配={}, 未过期={}, 当前时间={}, 过期时间={}", 
+           sign_match, not_expired, now, expire_time);
+    
+    sign_match && not_expired
 } 

@@ -6,9 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::time::{self};
-use tokio::sync::mpsc;
-use tokio::net::TcpListener;
-use chrono;
 
 use crate::cluster::Cluster;
 use crate::config::CONFIG;
@@ -16,7 +13,6 @@ use crate::constants::DEFAULT_KEEPALIVE_INTERVAL;
 use crate::keepalive::Keepalive;
 use crate::token::TokenManager;
 use crate::types::FileList;
-use crate::openapi;
 
 pub async fn bootstrap(version: &str) -> Result<()> {
     // 打印启动信息
@@ -66,24 +62,30 @@ pub async fn bootstrap(version: &str) -> Result<()> {
         }
     }
     
-    // 创建HTTP服务器
-    let mut router = cluster.setup_server_with_https(proto == "https").await?;
-    
-    // 添加API路由
-    let api_router = openapi::create_router();
-    router = router.merge(api_router);
+    // 创建并设置路由
+    let is_https = proto == "https";
     
     // 构建地址
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!("HTTP服务器监听于 {}", addr);
     
-    // 启动HTTP服务器
-    let cluster_clone = cluster.clone();
-    let server_handle = tokio::spawn(async move {
-        if let Err(e) = cluster_clone.start_server(router, addr).await {
-            error!("HTTP服务器错误: {}", e);
-        }
-    });
+    // 根据是否使用HTTPS选择不同的服务器启动方式
+    let server_handle = if is_https {
+        info!("使用HTTPS模式启动服务器于端口 {}", config.port);
+        // 启动HTTPS服务器
+        let _ = cluster.setup_server_with_https(true).await?;
+        // HTTPS服务器已在setup_server_with_https方法中启动
+        None 
+    } else {
+        info!("使用HTTP模式启动服务器于端口 {}", config.port);
+        let router = cluster.setup_server().await;
+        // 不再需要合并路由，直接使用cluster中的router
+        let cluster_clone = cluster.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = cluster_clone.start_server(router, addr).await {
+                error!("HTTP服务器错误: {}", e);
+            }
+        }))
+    };
     
     // 获取文件列表
     info!("获取文件列表...");
@@ -184,9 +186,14 @@ pub async fn bootstrap(version: &str) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(3)).await;
             
             // 等待服务器任务完成
-            if let Err(e) = server_handle.await {
-                error!("等待服务器关闭时发生错误: {}", e);
+            if let Some(handle) = server_handle {
+                match handle.await {
+                    Ok(_) => info!("HTTP服务器已成功关闭"),
+                    Err(e) => error!("等待HTTP服务器关闭时发生错误: {}", e)
+                }
             }
+            
+            info!("服务已成功关闭");
         },
         Err(e) => {
             error!("无法监听Ctrl+C信号: {}", e);

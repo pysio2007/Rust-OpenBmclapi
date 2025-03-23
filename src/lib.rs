@@ -5,7 +5,6 @@ pub mod constants;
 pub mod file;
 pub mod keepalive;
 pub mod logger;
-pub mod openapi;
 pub mod storage;
 pub mod token;
 pub mod types;

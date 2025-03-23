@@ -2151,6 +2151,7 @@ async fn serve_file(
 }
 
 pub fn validate_file(data: &[u8], hash: &str) -> bool {
+    // 在下载文件时仍然需要验证内容的SHA1哈希与文件名（hash）相符
     use sha1::{Sha1, Digest};
     let mut hasher = Sha1::new();
     hasher.update(data);

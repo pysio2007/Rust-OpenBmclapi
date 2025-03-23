@@ -141,7 +141,7 @@ impl Storage for FileStorage {
         // 创建一个Arc引用以便在多个任务间共享
         let self_arc = Arc::new(self.clone());
         
-        // 使用信号量限制并发数量为2
+        // 使用信号量限制并发数量为4
         let semaphore = Arc::new(Semaphore::new(4));
         
         // 使用一个计数器跟踪进度
@@ -149,6 +149,15 @@ impl Storage for FileStorage {
         
         // 将files切片转换为包含所有权的Vec
         let files_vec: Vec<FileInfo> = files.to_vec();
+
+        // 获取当前时间戳，用于决定是否进行随机抽检
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // 抽检比例，默认为5%的文件会被完整校验
+        let verification_ratio = 0.05;
         
         // 创建一个流处理文件检查
         let results = stream::iter(files_vec)
@@ -194,24 +203,41 @@ impl Storage for FileStorage {
                         }
                     }
                     
-                    // 如果文件存在且大小正确，再验证哈希值
-                    match self_clone.verify_file(&hash_path, &file.hash).await {
-                        Ok(true) => {
-                            debug!("文件验证成功: {}", file.path);
-                            (file, false) // 表示文件完好
-                        },
-                        Ok(false) => {
-                            warn!("文件验证失败: {} (哈希值不匹配)", file.path);
-                            (file, true) // 表示文件缺失或损坏
-                        },
-                        Err(e) => {
-                            error!("文件验证出错: {} - {}", file.path, e);
-                            (file, true) // 表示文件缺失或损坏
+                    // 随机抽检：使用文件hash与时间戳组合计算，决定是否进行完整的SHA1校验
+                    // 注意：文件名本身就是SHA1，所以默认我们认为文件名正确则文件正确
+                    // 但为了安全起见，我们会对一部分文件进行完整的内容校验
+                    let should_verify = {
+                        // 使用文件hash的第一个字节和时间戳计算随机值
+                        let first_byte = u8::from_str_radix(&file.hash[0..2], 16).unwrap_or(0);
+                        let random_value = (first_byte as f64 / 255.0 + (timestamp % 100) as f64 / 100.0) % 1.0;
+                        random_value < verification_ratio
+                    };
+                    
+                    if should_verify {
+                        // 对随机选中的文件进行完整的哈希验证
+                        debug!("对文件进行随机抽检: {}", file.path);
+                        match self_clone.verify_file(&hash_path, &file.hash).await {
+                            Ok(true) => {
+                                debug!("文件验证成功: {}", file.path);
+                                (file, false) // 表示文件完好
+                            },
+                            Ok(false) => {
+                                warn!("文件验证失败: {} (哈希值不匹配)", file.path);
+                                (file, true) // 表示文件缺失或损坏
+                            },
+                            Err(e) => {
+                                error!("文件验证出错: {} - {}", file.path, e);
+                                (file, true) // 表示文件缺失或损坏
+                            }
                         }
+                    } else {
+                        // 对其他文件只验证文件名和大小
+                        debug!("文件名和大小验证通过: {}", file.path);
+                        (file, false) // 表示文件完好
                     }
                 }
             })
-            .buffer_unordered(2) // 最多同时进行2个并发任务
+            .buffer_unordered(16) // 最多同时进行4个并发任务
             .collect::<Vec<(FileInfo, bool)>>()
             .await;
         

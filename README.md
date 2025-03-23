@@ -43,6 +43,7 @@ docker run -d \
   -v $(pwd)/cache:/app/cache \
   -e CLUSTER_ID=你的CLUSTER_ID \
   -e CLUSTER_SECRET=你的CLUSTER_SECRET \
+  -e BMCLAPI_CACHE_DIR=/app/cache \
   pysio/rust-openbmclapi:main
 ```
 
@@ -52,6 +53,7 @@ docker run -d \
 - `-v $(pwd)/cache:/app/cache`: 将主机当前目录下的cache文件夹挂载到容器内的/app/cache目录
 - `-e CLUSTER_ID`: 设置集群ID环境变量
 - `-e CLUSTER_SECRET`: 设置集群密钥环境变量
+- `-e BMCLAPI_CACHE_DIR`: 设置数据目录位置（可选，默认为 ./cache）
 
 您也可以使用docker-compose:
 
@@ -69,6 +71,7 @@ services:
     environment:
       - CLUSTER_ID=你的CLUSTER_ID
       - CLUSTER_SECRET=你的CLUSTER_SECRET
+      - BMCLAPI_CACHE_DIR=/app/cache
       # 可选配置
       # - CLUSTER_PORT=4000
       # - ENABLE_UPNP=false
@@ -90,6 +93,7 @@ docker-compose up -d
 CLUSTER_ID=你的CLUSTER_ID
 CLUSTER_SECRET=你的CLUSTER_SECRET
 CLUSTER_PORT=对外访问端口
+BMCLAPI_CACHE_DIR=数据目录路径  # 可选，默认为 ./cache
 ```
 
 CLUSTER_ID 和 CLUSTER_SECRET 请联系BMCLAPI管理员获取。
@@ -115,6 +119,7 @@ Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过
 - `CLUSTER_PUBLIC_PORT`：公网访问端口，默认与CLUSTER_PORT相同
 - `ENABLE_UPNP`：是否启用UPnP自动端口映射，默认false
 - `CLUSTER_STORAGE`：存储类型，支持file（本地文件）和webdav（WebDAV）
+- `BMCLAPI_CACHE_DIR`：数据目录位置，默认为 ./cache
 
 详细配置请参考`.env.example`文件。
 
@@ -126,6 +131,8 @@ Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过
 - 低资源占用
 - 自动UPnP端口映射
 - 支持SSL加密
+- 可自定义数据目录位置
+- 实时下载进度显示
 
 ## 贡献
 

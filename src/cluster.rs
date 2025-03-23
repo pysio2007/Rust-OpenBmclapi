@@ -16,6 +16,7 @@ use rust_socketio::{
     asynchronous::{Client as SocketClient, ClientBuilder},
     Payload, TransportType,
 };
+use indicatif;
 
 use crate::config::CONFIG;
 use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
@@ -43,16 +44,17 @@ pub struct Cluster {
     cert_key_files: Arc<RwLock<Option<(PathBuf, PathBuf)>>>,
     socket: Arc<RwLock<Option<SocketClient>>>,
     user_agent: String,
+    cache_dir: PathBuf,
 }
 
 impl Cluster {
     pub fn new(version: &str, token_manager: Arc<TokenManager>) -> Result<Self> {
         let config = CONFIG.read().unwrap().clone();
         
-        info!("DEBUG: Cluster创建，传入版本号: {}", version);
+        debug!("DEBUG: Cluster创建，传入版本号: {}", version);
         
         let user_agent = format!("{}/{}", USER_AGENT, version);
-        info!("DEBUG: Cluster UA: {}", user_agent);
+        debug!("DEBUG: Cluster UA: {}", user_agent);
         
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -66,6 +68,15 @@ impl Cluster {
             
         let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".ssl");
         std::fs::create_dir_all(&tmp_dir)?;
+
+        // 从环境变量获取cache目录位置，如果未设置则使用默认的cache目录
+        let cache_dir = std::env::var("BMCLAPI_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("cache"));
+        
+        // 确保cache目录存在
+        std::fs::create_dir_all(&cache_dir)?;
+        info!("使用缓存目录: {:?}", cache_dir);
         
         Ok(Cluster {
             client,
@@ -83,6 +94,7 @@ impl Cluster {
             cert_key_files: Arc::new(RwLock::new(None)),
             socket: Arc::new(RwLock::new(None)),
             user_agent,
+            cache_dir,
         })
     }
     
@@ -146,7 +158,7 @@ impl Cluster {
                 info!("收到证书响应回调");
                 match message {
                     Payload::Text(values) => {
-                        info!("处理证书响应的文本数据: {:?}", values);
+                        debug!("处理证书响应的文本数据: {:?}", values);
                         if values.is_empty() {
                             error!("证书响应为空");
                             return;
@@ -380,7 +392,7 @@ impl Cluster {
                     }
                 
                     let _storage = cluster.get_storage();
-                    let storage_path = std::path::Path::new("cache").join(&path);
+                    let storage_path = cluster.cache_dir.join(&path);
                     
                     match tokio::fs::read_dir(storage_path).await {
                         Ok(mut entries) => {
@@ -1245,7 +1257,7 @@ impl Cluster {
             return Ok(());
         }
         
-        info!("mismatch {} files, start syncing", missing_files.len());
+        info!("发现 {} 个文件需要同步, 开始同步", missing_files.len());
         info!("{:?} 同步策略", sync_config);
         
         let token = self.token_manager.get_token().await?;
@@ -1255,6 +1267,27 @@ impl Cluster {
         
         let total_count = missing_files.len();
         let mut success_count = 0;
+        let mut total_bytes = 0u64;
+        
+        // 计算总字节数
+        for file in &missing_files {
+            total_bytes += file.size;
+        }
+        
+        info!("总计需要下载: {} 个文件, {} 字节", total_count, total_bytes);
+        
+        // 创建多进度条
+        let multi_progress = indicatif::MultiProgress::new();
+        
+        // 创建总进度条
+        let total_progress = multi_progress.add(indicatif::ProgressBar::new(total_bytes));
+        total_progress.set_style(indicatif::ProgressStyle::default_bar()
+            .template("[总进度] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("=>-"));
+            
+        let multi_progress = Arc::new(multi_progress);
+        let total_progress = Arc::new(total_progress);
         
         use futures::stream::{self, StreamExt};
         
@@ -1265,8 +1298,21 @@ impl Cluster {
                 let storage = self.storage.clone();
                 let _source = source.clone();
                 let _base_url = self.base_url.clone();
+                let multi_progress = multi_progress.clone();
+                let total_progress = total_progress.clone();
+                let cache_dir = self.cache_dir.clone();
                 
                 async move {
+                    // 为每个文件创建单独的进度条
+                    let file_progress = multi_progress.add(indicatif::ProgressBar::new(file.size));
+                    file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                        .template("[{filename}] [{bar:40.green/red}] {bytes}/{total_bytes}")
+                        .unwrap()
+                        .progress_chars("=>-"));
+                    
+                    let filename = file.path.split('/').last().unwrap_or(&file.path);
+                    file_progress.set_message(filename.to_string());
+                    
                     info!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
                     
                     for retry in 0..10 {
@@ -1306,12 +1352,22 @@ impl Cluster {
                                                 continue;
                                             }
                                             
-                                            let hash_path = hash_to_filename(&file.hash);
-                                            if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                            // 确保目录存在
+                                            let hash_path = cache_dir.join(hash_to_filename(&file.hash));
+                                            if let Some(parent) = hash_path.parent() {
+                                                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                                    error!("创建目录失败 {}: {}", parent.display(), e);
+                                                    continue;
+                                                }
+                                            }
+                                            
+                                            if let Err(e) = storage.write_file(hash_path.to_str().unwrap().to_string(), bytes.to_vec(), &file).await {
                                                 error!("保存文件 {} 失败: {}", file.path, e);
                                                 continue;
                                             }
                                             
+                                            file_progress.finish_with_message(format!("{} - 完成", filename));
+                                            total_progress.inc(file.size);
                                             debug!("文件 {} 同步成功", file.path);
                                             return Ok(file.path.clone());
                                         }
@@ -1339,12 +1395,22 @@ impl Cluster {
                                                                     continue;
                                                                 }
                                                                 
-                                                                let hash_path = hash_to_filename(&file.hash);
-                                                                if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                                                // 确保目录存在
+                                                                let hash_path = cache_dir.join(hash_to_filename(&file.hash));
+                                                                if let Some(parent) = hash_path.parent() {
+                                                                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                                                        error!("创建目录失败 {}: {}", parent.display(), e);
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                                
+                                                                if let Err(e) = storage.write_file(hash_path.to_str().unwrap().to_string(), bytes.to_vec(), &file).await {
                                                                     error!("保存文件 {} 失败: {}", file.path, e);
                                                                     continue;
                                                                 }
                                                                 
+                                                                file_progress.finish_with_message(format!("{} - 完成", filename));
+                                                                total_progress.inc(file.size);
                                                                 debug!("文件 {} 同步成功", file.path);
                                                                 return Ok(file.path.clone());
                                                             }
@@ -1380,6 +1446,7 @@ impl Cluster {
                         }
                     }
                     
+                    file_progress.finish_with_message(format!("{} - 失败", filename));
                     error!("下载文件 {} 失败，已重试多次", file.path);
                     Err(anyhow!("下载文件 {} 失败", file.path))
                 }
@@ -1387,6 +1454,8 @@ impl Cluster {
             .buffer_unordered(parallel)
             .collect::<Vec<Result<String>>>()
             .await;
+        
+        total_progress.finish_with_message("下载完成");
         
         let mut has_error = false;
         for result in &results {
@@ -1539,8 +1608,8 @@ impl Cluster {
         for service in ip_services {
             info!("尝试从 {} 获取公网IP...", service);
             match client.get(service).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
+                            Ok(response) => {
+                                if response.status().is_success() {
                         if let Ok(ip) = response.text().await {
                             let ip = ip.trim();
                             if !ip.is_empty() {
@@ -1582,6 +1651,7 @@ impl Clone for Cluster {
             cert_key_files: self.cert_key_files.clone(),
             socket: self.socket.clone(),
             user_agent: self.user_agent.clone(),
+            cache_dir: self.cache_dir.clone(),
         }
     }
 }

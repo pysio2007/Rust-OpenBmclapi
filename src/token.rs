@@ -75,12 +75,12 @@ impl TokenManager {
 
     async fn fetch_token(&self) -> Result<String> {
         // 添加调试输出
-        info!("DEBUG: TokenManager版本号: {}", self.version);
-        info!("DEBUG: TokenManager UA: {}", self.user_agent);
+        debug!("DEBUG: TokenManager版本号: {}", self.version);
+        debug!("DEBUG: TokenManager UA: {}", self.user_agent);
         
         // 1. 请求challenge
         let challenge_url = format!("{}/openbmclapi-agent/challenge", self.prefix_url);
-        info!("DEBUG: 请求challenge URL: {}", challenge_url);
+        debug!("DEBUG: 请求challenge URL: {}", challenge_url);
         
         let response = self.client
             .get(&challenge_url)
@@ -128,7 +128,7 @@ impl TokenManager {
 
     fn schedule_refresh_token(&self, ttl: u64) {
         let next_ms = std::cmp::max(ttl.saturating_sub(600_000), ttl / 2); // ttl - 10分钟或ttl/2
-        trace!("计划在{}ms后刷新令牌", next_ms);
+        info!("计划在{}ms后刷新令牌", next_ms);
         
         // 克隆需要的变量，避免使用self
         let cluster_id = self.cluster_id.clone();

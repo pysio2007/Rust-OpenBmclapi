@@ -8,6 +8,7 @@ use tokio::signal;
 use tokio::time::{self};
 use tokio::sync::mpsc;
 use tokio::net::TcpListener;
+use chrono;
 
 use crate::cluster::Cluster;
 use crate::config::CONFIG;
@@ -137,21 +138,45 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     let cluster_clone = cluster.clone();
     tokio::spawn(async move {
         let mut interval = time::interval(check_file_interval);
+        let mut last_check_time = chrono::Utc::now();
         
         loop {
             interval.tick().await;
             
-            debug!("检查新文件...");
+            let now = chrono::Utc::now();
+            let elapsed = now.signed_duration_since(last_check_time);
+            
+            debug!("开始检查新文件... (距离上次检查: {}秒)", elapsed.num_seconds());
             match check_new_files(&cluster_clone, &last_files).await {
                 Ok(new_files) => {
                     if !new_files.files.is_empty() {
+                        let diff_count = new_files.files.len() - last_files.files.len();
+                        if diff_count > 0 {
+                            info!("发现 {} 个新文件需要同步", diff_count);
+                            
+                            // 计算新增文件的总大小
+                            let mut new_files_size = 0u64;
+                            for file in &new_files.files {
+                                if !last_files.files.iter().any(|f| f.hash == file.hash) {
+                                    new_files_size += file.size;
+                                }
+                            }
+                            
+                            if new_files_size > 0 {
+                                info!("新文件总大小: {} 字节", new_files_size);
+                            }
+                        }
                         last_files = new_files;
+                    } else {
+                        debug!("没有发现新文件");
                     }
                 },
                 Err(e) => {
                     error!("检查新文件错误: {}", e);
                 }
             }
+            
+            last_check_time = now;
         }
     });
     

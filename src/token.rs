@@ -32,20 +32,21 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
-    pub fn new(cluster_id: String, cluster_secret: String, version: String) -> Self {
+    pub fn new(cluster_id: String, cluster_secret: String, _version: String) -> Self {
         let prefix_url = env::var("CLUSTER_BMCLAPI")
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
         
         // 创建HTTP客户端
         let client = Client::builder()
-            .timeout(Duration::from_secs(300)) // 5分钟超时
+            .timeout(Duration::from_secs(30))
+            .user_agent(format!("openbmclapi-cluster/{}", "1.13.1")) // 硬编码版本号
             .build()
-            .expect("创建HTTP客户端失败");
+            .unwrap_or_else(|_| Client::new());
 
         TokenManager {
             cluster_id,
             cluster_secret,
-            version,
+            version: "1.13.1".to_string(),
             token: Arc::new(RwLock::new(None)),
             client,
             prefix_url,
@@ -70,7 +71,7 @@ impl TokenManager {
         let response = self.client
             .get(&challenge_url)
             .query(&[("clusterId", &self.cluster_id)])
-            .header("user-agent", format!("openbmclapi-cluster/{}", self.version))
+            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
             .send()
             .await?;
 
@@ -95,7 +96,7 @@ impl TokenManager {
                 "challenge": challenge.challenge,
                 "signature": signature,
             }))
-            .header("user-agent", format!("openbmclapi-cluster/{}", self.version))
+            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
             .send()
             .await?;
 
@@ -143,7 +144,7 @@ impl TokenManager {
                     "clusterId": cluster_id,
                     "token": current_token,
                 }))
-                .header("user-agent", format!("openbmclapi-cluster/{}", version))
+                .header("user-agent", format!("rust-openbmclapi-cluster/{}", version))
                 .send()
                 .await {
                     Ok(resp) => resp,
@@ -212,7 +213,7 @@ impl TokenManager {
                 "clusterId": self.cluster_id,
                 "token": current_token,
             }))
-            .header("user-agent", format!("openbmclapi-cluster/{}", self.version))
+            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
             .send()
             .await?;
 

@@ -5,7 +5,7 @@ use axum::extract::{Query, State, Path};
 use axum::http::{StatusCode, Request};
 use axum::response::IntoResponse;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::json;   
 use std::collections::HashMap;
 use log::{debug, error, info, warn};
 use std::path::PathBuf;
@@ -16,7 +16,6 @@ use rust_socketio::{
     asynchronous::{Client as SocketClient, ClientBuilder},
     Payload, TransportType,
 };
-use tokio::sync::broadcast;
 
 use crate::config::CONFIG;
 use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
@@ -25,22 +24,6 @@ use crate::storage::get_storage;
 use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
-
-struct SocketState {
-    cert_receiver: Option<broadcast::Receiver<Vec<Value>>>,
-    enable_receiver: Option<broadcast::Receiver<Vec<Value>>>,
-    disable_receiver: Option<broadcast::Receiver<Vec<Value>>>,
-}
-
-impl Default for SocketState {
-    fn default() -> Self {
-        Self {
-            cert_receiver: None,
-            enable_receiver: None,
-            disable_receiver: None,
-        }
-    }
-}
 
 pub struct Cluster {
     client: Client,
@@ -57,7 +40,6 @@ pub struct Cluster {
     tmp_dir: PathBuf,
     cert_key_files: Arc<RwLock<Option<(PathBuf, PathBuf)>>>,
     socket: Arc<RwLock<Option<SocketClient>>>,
-    socket_state: Arc<RwLock<SocketState>>,
 }
 
 impl Cluster {
@@ -67,6 +49,7 @@ impl Cluster {
         // 创建HTTP客户端
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
+            .user_agent(format!("rust-openbmclapi-cluster/{}", "1.13.1"))
             .build()?;
         
         // 获取配置的存储
@@ -76,7 +59,7 @@ impl Cluster {
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
             
         // 创建临时目录
-        let tmp_dir = std::env::temp_dir().join("rust-bmclapi");
+        let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".ssl");
         std::fs::create_dir_all(&tmp_dir)?;
         
         Ok(Cluster {
@@ -94,7 +77,6 @@ impl Cluster {
             tmp_dir,
             cert_key_files: Arc::new(RwLock::new(None)),
             socket: Arc::new(RwLock::new(None)),
-            socket_state: Arc::new(RwLock::new(SocketState::default())),
         })
     }
     
@@ -136,86 +118,189 @@ impl Cluster {
         *self.want_enable.read().unwrap()
     }
     
-    pub async fn request_cert(&self) -> Result<()> {
+    pub async fn request_cert(&self) -> bool {
         // 获取当前的socket连接
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回错误
+        // 如果没有现有连接，则返回false
         let socket = match socket_opt {
             Some(socket) => socket,
-            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+            None => {
+                warn!("没有可用的Socket.IO连接，请先调用connect()方法建立连接");
+                return false;
+            },
         };
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let tmp_dir = self.tmp_dir.clone();
+        let cert_key_files = self.cert_key_files.clone();
         
-        // 获取证书接收器
-        let mut cert_rx = {
-            let state = self.socket_state.read().unwrap();
-            match &state.cert_receiver {
-                Some(rx) => rx.resubscribe(),
-                None => return Err(anyhow!("没有可用的证书响应接收器，请先调用connect()方法建立连接")),
+        let ack_callback = move |message: Payload, _| {
+            let tmp_dir = tmp_dir.clone();
+            let cert_key_files = cert_key_files.clone();
+            async move {
+                info!("收到证书响应回调");
+                match message {
+                    Payload::Text(values) => {
+                        info!("处理证书响应的文本数据: {:?}", values);
+                        if values.is_empty() {
+                            error!("证书响应为空");
+                            return;
+                        }
+                        
+                        // 根据实际返回的格式: [Array [Array [Null, Object {...}]]]
+                        // 获取最外层的数组
+                        let outer_array = match values.get(0) {
+                            Some(array) if array.is_array() => array.as_array().unwrap(),
+                            _ => {
+                                error!("证书响应格式错误: 第一元素不是数组");
+                                return;
+                            }
+                        };
+                        
+                        // 获取内层的数组
+                        let inner_array = match outer_array.get(0) {
+                            Some(array) if array.is_array() => array.as_array().unwrap(),
+                            _ => {
+                                error!("证书响应格式错误: 第二层元素不是数组");
+                                return;
+                            }
+                        };
+                        
+                        // 检查内层数组长度是否至少为2
+                        if inner_array.len() < 2 {
+                            error!("证书响应格式错误: 内层数组长度不足，需要至少两个元素");
+                            return;
+                        }
+                        
+                        // 第二个元素应该是包含证书和密钥的对象
+                        let cert_data = &inner_array[1];
+                        if !cert_data.is_object() {
+                            error!("证书响应格式错误: 内层数组的第二个元素不是对象，实际值: {:?}", cert_data);
+                            return;
+                        }
+                        
+                        // 从对象中提取证书和密钥
+                        let cert = cert_data.get("cert");
+                        let key = cert_data.get("key");
+                        
+                        if cert.is_none() || key.is_none() {
+                            error!("证书响应中缺少cert或key字段: {:?}", cert_data);
+                            return;
+                        }
+                        
+                        let cert = cert.unwrap();
+                        let key = key.unwrap();
+                        
+                        if !cert.is_string() || !key.is_string() {
+                            error!("证书或密钥不是字符串格式: cert类型={}, key类型={}", 
+                                  cert.is_string(), key.is_string());
+                            return;
+                        }
+                        
+                        // 准备文件路径
+                        let cert_file = tmp_dir.join("cert.pem");
+                        let key_file = tmp_dir.join("key.pem");
+                        
+                        info!("准备保存证书到: {:?}", cert_file);
+                        info!("准备保存密钥到: {:?}", key_file);
+                        
+                        // 确保目录存在
+                        if let Some(parent) = cert_file.parent() {
+                            if !parent.exists() {
+                                match tokio::fs::create_dir_all(parent).await {
+                                    Ok(_) => info!("创建证书目录成功: {:?}", parent),
+                                    Err(e) => {
+                                        error!("创建证书目录失败: {:?}, 错误: {}", parent, e);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 如果文件已存在，先删除
+                        if cert_file.exists() {
+                            if let Err(e) = tokio::fs::remove_file(&cert_file).await {
+                                error!("删除现有证书文件失败: {}", e);
+                            }
+                        }
+                        
+                        if key_file.exists() {
+                            if let Err(e) = tokio::fs::remove_file(&key_file).await {
+                                error!("删除现有密钥文件失败: {}", e);
+                            }
+                        }
+
+                        // 保存证书和密钥
+                        let cert_str = cert.as_str().unwrap();
+                        let key_str = key.as_str().unwrap();
+                        
+                        match tokio::fs::write(&cert_file, cert_str).await {
+                            Ok(_) => info!("成功写入证书文件"),
+                            Err(e) => {
+                                error!("写入证书文件失败: {}", e);
+                                return;
+                            }
+                        }
+                        
+                        match tokio::fs::write(&key_file, key_str).await {
+                            Ok(_) => info!("成功写入密钥文件"),
+                            Err(e) => {
+                                error!("写入密钥文件失败: {}", e);
+                                return;
+                            }
+                        }
+                        
+                        // 更新证书路径记录
+                        let mut cert_files_guard = cert_key_files.write().unwrap();
+                        *cert_files_guard = Some((cert_file.clone(), key_file.clone()));
+                        info!("已更新证书和密钥文件路径记录");
+                    },
+                    _ => error!("收到非文本格式的证书响应: {:?}", message),
+                }
+            }.boxed()
+        };
+
+        info!("发送证书请求...");
+        let res = socket
+            .emit_with_ack("request-cert", "", Duration::from_secs(10), ack_callback)
+            .await;
+            
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        
+        // 验证证书文件是否存在
+        let cert_files = self.cert_key_files.read().unwrap();
+        let file_exists = if let Some((cert_path, key_path)) = &*cert_files {
+            let cert_exists = std::path::Path::new(cert_path).exists();
+            let key_exists = std::path::Path::new(key_path).exists();
+            
+            if !cert_exists {
+                error!("证书文件不存在: {:?}", cert_path);
             }
-        };
-        
-        // 请求证书
-        info!("正在请求证书...");
-        match socket.emit("request-cert", json!({})).await {
-            Ok(_) => info!("证书请求已发送"),
-            Err(e) => {
-                error!("发送证书请求失败: {}", e);
-                return Err(anyhow!("发送证书请求失败: {}", e));
+            
+            if !key_exists {
+                error!("密钥文件不存在: {:?}", key_path);
             }
+            
+            cert_exists && key_exists
+        } else {
+            error!("没有记录证书和密钥文件路径");
+            false
         };
         
-        // 等待响应，最多等待10秒
-        let cert_array = match tokio::time::timeout(
-            Duration::from_secs(10), 
-            cert_rx.recv()
-        ).await {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => return Err(anyhow!("接收证书响应失败: {}", e)),
-            Err(_) => return Err(anyhow!("请求证书超时")),
-        };
-        
-        // 检查数组长度
-        if cert_array.len() < 2 {
-            return Err(anyhow!("证书响应格式错误: 数组长度不足"));
+        if res.is_err() {
+            error!("请求证书失败: {:?}", res.err());
+            false
+        } else if !file_exists {
+            error!("证书请求成功但文件未正确保存");
+            false
+        } else {
+            info!("成功获取并保存证书和密钥");
+            true
         }
-        
-        // 检查第一个元素是否为错误对象
-        if !cert_array[0].is_null() {
-            return Err(anyhow!("请求证书失败: {:?}", cert_array[0]));
-        }
-        
-        // 从第二个元素中提取证书和密钥
-        let cert_data = &cert_array[1];
-        
-        // 提取证书和密钥
-        let cert = cert_data.get("cert")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("服务器返回的证书格式不正确"))?;
-        
-        let key = cert_data.get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("服务器返回的密钥格式不正确"))?;
-        
-        // 保存证书和密钥到临时目录
-        let cert_path = self.tmp_dir.join("cert.pem");
-        let key_path = self.tmp_dir.join("key.pem");
-        
-        tokio::fs::write(&cert_path, cert).await?;
-        tokio::fs::write(&key_path, key).await?;
-        
-        info!("证书已保存到: {:?}", cert_path);
-        
-        // 更新证书路径
-        {
-            let mut cert_files = self.cert_key_files.write().unwrap();
-            *cert_files = Some((cert_path, key_path));
-        }
-        
-        Ok(())
     }
     
     pub async fn use_self_cert(&self) -> Result<()> {
@@ -281,8 +366,6 @@ impl Cluster {
         
         Router::new()
             .route("/files/:hash_path", get(serve_file))
-            .route("/measure/:size", get(measure_handler))
-            .route("/auth", get(auth_handler))
             .route("/list/directory", get(
                 |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
                     // 从URL中提取sign和path参数
@@ -442,15 +525,6 @@ impl Cluster {
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 获取enable响应接收器
-        let mut enable_rx = {
-            let state = self.socket_state.read().unwrap();
-            match &state.enable_receiver {
-                Some(rx) => rx.resubscribe(),
-                None => return Err(anyhow!("没有可用的enable响应接收器，请先调用connect()方法建立连接")),
-            }
-        };
-        
         // 获取IP和端口
         let public_ip = match Self::find_public_ip().await {
             Ok(ip) => ip,
@@ -467,58 +541,76 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": self.version,
+            "version": "1.13.1",
         });
         
         info!("发送的payload: {}", payload);
         
-        // 发送enable事件
+        // 准备用于持有结果的变量
+        let is_enabled = self.is_enabled.clone();
+        
+        // 创建回调函数
+        let ack_callback = move |message: Payload, _| {
+            let is_enabled = is_enabled.clone();
+            async move {
+                info!("收到enable响应回调");
+                match message {
+                    Payload::Text(values) => {
+                        info!("处理enable响应的文本数据: {:?}", values);
+                        
+                        if values.len() < 2 {
+                            error!("启用集群响应格式错误: 数组长度不足");
+                            return;
+                        }
+                        
+                        // 检查错误
+                        if !values[0].is_null() {
+                            if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
+                                error!("启用集群失败: {}", err_msg);
+                                return;
+                            } else {
+                                error!("启用集群失败: {:?}", values[0]);
+                                return;
+                            }
+                        }
+                        
+                        // 检查确认
+                        if values[1].as_bool() != Some(true) {
+                            error!("节点注册失败: 未收到成功确认");
+                            return;
+                        }
+                        
+                        // 设置状态为已启用
+                        {
+                            let mut is_enabled_guard = is_enabled.write().unwrap();
+                            *is_enabled_guard = true;
+                            info!("集群已成功启用");
+                        }
+                    },
+                    _ => error!("收到非文本格式的enable响应: {:?}", message),
+                }
+            }.boxed()
+        };
+        
+        // 发送enable事件并等待回调
         info!("发送启用请求...");
-        match socket.emit("enable", payload).await {
-            Ok(_) => info!("启用请求已发送"),
-            Err(e) => {
-                error!("发送启用请求失败: {}", e);
-                return Err(anyhow!("发送启用请求失败: {}", e));
-            }
-        };
+        let res = socket
+            .emit_with_ack("enable", payload, Duration::from_secs(300), ack_callback)
+            .await;
+            
+        // 等待一段时间以确保回调有机会处理
+        tokio::time::sleep(Duration::from_secs(5)).await;
         
-        // 等待响应，最多等待5分钟
-        let timeout_duration = Duration::from_secs(300); // 5分钟
-        let result = match tokio::time::timeout(
-            timeout_duration,
-            enable_rx.recv()
-        ).await {
-            Ok(Ok(values)) => values,
-            Ok(Err(e)) => return Err(anyhow!("接收启用响应失败: {}", e)),
-            Err(_) => return Err(anyhow!("节点注册超时")),
-        };
-        
-        // 检查结果
-        if result.len() < 2 {
-            return Err(anyhow!("启用集群响应格式错误: 数组长度不足"));
+        if res.is_err() {
+            error!("发送启用请求失败: {:?}", res.err());
+            return Err(anyhow!("发送启用请求失败"));
         }
         
-        // 检查错误
-        if !result[0].is_null() {
-            if let Some(err_msg) = result[0].get("message").and_then(|v| v.as_str()) {
-                return Err(anyhow!(err_msg.to_string()));
-            } else {
-                return Err(anyhow!("启用集群失败: {:?}", result[0]));
-            }
+        // 检查状态是否已更新为启用
+        if !*self.is_enabled.read().unwrap() {
+            return Err(anyhow!("节点注册失败或超时"));
         }
         
-        // 检查确认
-        if result[1].as_bool() != Some(true) {
-            return Err(anyhow!("节点注册失败"));
-        }
-        
-        // 设置状态为已启用
-        {
-            let mut is_enabled = self.is_enabled.write().unwrap();
-            *is_enabled = true;
-        }
-        
-        info!("集群已成功启用");
         Ok(())
     }
     
@@ -546,61 +638,71 @@ impl Cluster {
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 获取disable响应接收器
-        let mut disable_rx = {
-            let state = self.socket_state.read().unwrap();
-            match &state.disable_receiver {
-                Some(rx) => rx.resubscribe(),
-                None => return Err(anyhow!("没有可用的disable响应接收器，请先调用connect()方法建立连接")),
-            }
+        // 准备用于持有结果的变量
+        let is_enabled = self.is_enabled.clone();
+        
+        // 创建回调函数
+        let ack_callback = move |message: Payload, _| {
+            let is_enabled = is_enabled.clone();
+            async move {
+                info!("收到disable响应回调");
+                match message {
+                    Payload::Text(values) => {
+                        info!("处理disable响应的文本数据: {:?}", values);
+                        
+                        if values.len() < 2 {
+                            error!("禁用集群响应格式错误: 数组长度不足");
+                            return;
+                        }
+                        
+                        // 检查错误
+                        if !values[0].is_null() {
+                            if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
+                                error!("禁用集群失败: {}", err_msg);
+                                return;
+                            } else {
+                                error!("禁用集群失败: {:?}", values[0]);
+                                return;
+                            }
+                        }
+                        
+                        // 检查确认
+                        if values[1].as_bool() != Some(true) {
+                            error!("节点禁用失败: 未收到成功确认");
+                            return;
+                        }
+                        
+                        // 设置状态为已禁用
+                        {
+                            let mut is_enabled_guard = is_enabled.write().unwrap();
+                            *is_enabled_guard = false;
+                            info!("集群已成功禁用");
+                        }
+                    },
+                    _ => error!("收到非文本格式的disable响应: {:?}", message),
+                }
+            }.boxed()
         };
         
-        // 发送disable事件
+        // 发送disable事件并等待回调
         info!("发送禁用请求...");
-        match socket.emit("disable", json!(null)).await {
-            Ok(_) => info!("禁用请求已发送"),
-            Err(e) => {
-                error!("发送禁用请求失败: {}", e);
-                return Err(anyhow!("发送禁用请求失败: {}", e));
-            }
-        };
+        let res = socket
+            .emit_with_ack("disable", json!(null), Duration::from_secs(30), ack_callback)
+            .await;
+            
+        // 等待一段时间以确保回调有机会处理
+        tokio::time::sleep(Duration::from_secs(3)).await;
         
-        // 等待响应
-        let result = match tokio::time::timeout(
-            Duration::from_secs(30),
-            disable_rx.recv()
-        ).await {
-            Ok(Ok(values)) => values,
-            Ok(Err(e)) => return Err(anyhow!("接收禁用响应失败: {}", e)),
-            Err(_) => return Err(anyhow!("禁用集群超时")),
-        };
-        
-        // 检查结果
-        if result.len() < 2 {
-            return Err(anyhow!("禁用集群响应格式错误: 数组长度不足"));
+        if res.is_err() {
+            error!("发送禁用请求失败: {:?}", res.err());
+            return Err(anyhow!("发送禁用请求失败"));
         }
         
-        // 检查错误
-        if !result[0].is_null() {
-            if let Some(err_msg) = result[0].get("message").and_then(|v| v.as_str()) {
-                return Err(anyhow!(err_msg.to_string()));
-            } else {
-                return Err(anyhow!("禁用集群失败: {:?}", result[0]));
-            }
+        // 检查状态是否已更新为禁用
+        if *self.is_enabled.read().unwrap() {
+            return Err(anyhow!("节点禁用失败或超时"));
         }
         
-        // 检查确认
-        if result[1].as_bool() != Some(true) {
-            return Err(anyhow!("节点禁用失败"));
-        }
-        
-        // 设置状态为已禁用
-        {
-            let mut is_enabled = self.is_enabled.write().unwrap();
-            *is_enabled = false;
-        }
-        
-        info!("集群已成功禁用");
         Ok(())
     }
     
@@ -614,7 +716,7 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": self.version,
+            "version": "1.13.1",
         });
         
         // 获取当前的socket连接
@@ -629,16 +731,32 @@ impl Cluster {
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 发送心跳事件
-        debug!("发送心跳...");
-        match socket.emit("heartbeat", payload).await {
-            Ok(_) => debug!("心跳已发送"),
-            Err(e) => {
-                error!("发送心跳失败: {}", e);
-                return Err(anyhow!("发送心跳失败: {}", e));
-            }
+        // 创建回调函数
+        let ack_callback = move |message: Payload, _| {
+            async move {
+                debug!("收到heartbeat响应回调");
+                match message {
+                    Payload::Text(values) => {
+                        debug!("处理heartbeat响应的文本数据: {:?}", values);
+                        // 心跳通常不需要处理响应数据，只需要确认服务器收到了请求
+                    },
+                    _ => error!("收到非文本格式的heartbeat响应: {:?}", message),
+                }
+            }.boxed()
         };
         
+        // 发送heartbeat事件并等待回调
+        debug!("发送心跳...");
+        let res = socket
+            .emit_with_ack("heartbeat", payload, Duration::from_secs(5), ack_callback)
+            .await;
+            
+        if res.is_err() {
+            error!("发送心跳失败: {:?}", res.err());
+            return Err(anyhow!("发送心跳失败"));
+        }
+        
+        debug!("心跳请求已完成");
         Ok(())
     }
     
@@ -649,83 +767,10 @@ impl Cluster {
         // 获取认证令牌
         let token = self.token_manager.get_token().await?;
         
-        // 创建各种事件响应通道
-        let (cert_tx, cert_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
-        let cert_tx = Arc::new(cert_tx);
-        
-        let (enable_tx, enable_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
-        let enable_tx = Arc::new(enable_tx);
-        
-        let (disable_tx, disable_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
-        let disable_tx = Arc::new(disable_tx);
-        
         // 创建新的Socket.IO客户端
         let mut socket_builder = ClientBuilder::new(&self.base_url)
             .transport_type(TransportType::Websocket)
             .auth(json!({"token": token}));
-        
-        // 注册request-cert事件监听器
-        socket_builder = socket_builder.on("request-cert", {
-            let cert_tx = cert_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let cert_tx = cert_tx.clone();
-                async move {
-                    info!("收到证书响应");
-                    match payload {
-                        Payload::Text(values) => {
-                            if let Err(e) = cert_tx.send(values) {
-                                error!("发送证书响应到通道失败: {}", e);
-                            } else {
-                                debug!("已将证书响应发送到通道");
-                            }
-                        },
-                        _ => error!("收到非文本格式的证书响应: {:?}", payload),
-                    }
-                }.boxed()
-            }
-        });
-        
-        // 注册enable事件监听器
-        socket_builder = socket_builder.on("enable", {
-            let enable_tx = enable_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let enable_tx = enable_tx.clone();
-                async move {
-                    info!("收到enable响应");
-                    match payload {
-                        Payload::Text(values) => {
-                            if let Err(e) = enable_tx.send(values) {
-                                error!("发送enable响应到通道失败: {}", e);
-                            } else {
-                                debug!("已将enable响应发送到通道");
-                            }
-                        },
-                        _ => error!("收到非文本格式的enable响应: {:?}", payload),
-                    }
-                }.boxed()
-            }
-        });
-        
-        // 注册disable事件监听器
-        socket_builder = socket_builder.on("disable", {
-            let disable_tx = disable_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let disable_tx = disable_tx.clone();
-                async move {
-                    info!("收到disable响应");
-                    match payload {
-                        Payload::Text(values) => {
-                            if let Err(e) = disable_tx.send(values) {
-                                error!("发送disable响应到通道失败: {}", e);
-                            } else {
-                                debug!("已将disable响应发送到通道");
-                            }
-                        },
-                        _ => error!("收到非文本格式的disable响应: {:?}", payload),
-                    }
-                }.boxed()
-            }
-        });
         
         // 连接事件
         socket_builder = socket_builder.on("connect", {
@@ -777,15 +822,6 @@ impl Cluster {
                     let mut socket_guard = self.socket.write().unwrap();
                     *socket_guard = Some(socket.clone());
                     info!("已将新的Socket.IO连接保存到共享状态");
-                }
-                
-                // 保存各种响应接收器
-                {
-                    let mut state = self.socket_state.write().unwrap();
-                    state.cert_receiver = Some(cert_rx);
-                    state.enable_receiver = Some(enable_rx);
-                    state.disable_receiver = Some(disable_rx);
-                    debug!("已保存所有事件响应接收器");
                 }
                 
                 // 记录基本连接信息
@@ -901,7 +937,40 @@ impl Cluster {
             if let Some(socket) = socket_opt {
                 debug!("发送keep-alive数据: {:?} (当前时间戳: {})", payload, start_time);
                 
-                match socket.emit("keep-alive", payload).await {
+                // 获取计数器的可变引用
+                let counters = self.counters.clone();
+                let current_hits = current_counter.hits;
+                let current_bytes = current_counter.bytes;
+                
+                // 创建回调函数
+                let ack_callback = move |message: Payload, _| {
+                    let counters = counters.clone();
+                    let current_hits = current_hits;
+                    let current_bytes = current_bytes;
+                    async move {
+                        debug!("收到keep-alive响应回调");
+                        match message {
+                            Payload::Text(values) => {
+                                debug!("处理keep-alive响应的文本数据: {:?}", values);
+                                
+                                // 更新计数器，减去已报告的值
+                                {
+                                    let mut counters_guard = counters.write().unwrap();
+                                    counters_guard.hits -= current_hits;
+                                    counters_guard.bytes -= current_bytes;
+                                    debug!("更新计数器 - 当前计数 hits: {}, bytes: {}", 
+                                         counters_guard.hits, counters_guard.bytes);
+                                }
+                                
+                                debug!("keep-alive处理完成");
+                            },
+                            _ => error!("收到非文本格式的keep-alive响应: {:?}", message),
+                        }
+                    }.boxed()
+                };
+                
+                // 发送keep-alive事件并等待回调
+                match socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), ack_callback).await {
                     Ok(_) => {
                         // 发送成功，重置失败计数
                         if failed_keepalive > 0 {
@@ -910,22 +979,11 @@ impl Cluster {
                             debug!("keep-alive发送成功");
                         }
                         failed_keepalive = 0;
-                        
-                        // 更新计数器，减去已报告的值
-                        {
-                            let mut counters = self.counters.write().unwrap();
-                            counters.hits -= current_counter.hits;
-                            counters.bytes -= current_counter.bytes;
-                            debug!("更新计数器 - 当前计数 hits: {}, bytes: {}", 
-                                  counters.hits, counters.bytes);
-                        }
-                        
-                        debug!("keep-alive处理完成，等待下一个周期");
                     },
                     Err(e) => {
                         failed_keepalive += 1;
                         error!("发送keep-alive失败 ({}/3): {}, 错误详情: {:?}", 
-                              failed_keepalive, e, e);
+                             failed_keepalive, e, e);
                         
                         if failed_keepalive >= 3 {
                             error!("连续3次keep-alive失败，将禁用集群 (当前连接可能已断开)");
@@ -966,6 +1024,7 @@ impl Cluster {
         
         let response = self.client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
+            .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
             .send()
             .await?;
             
@@ -992,6 +1051,7 @@ impl Cluster {
         
         let response = self.client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
+            .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
             .send()
             .await?;
             
@@ -1069,6 +1129,7 @@ impl Cluster {
                     // 下载文件
                     let response = client.get(&url)
                         .header("Authorization", format!("Bearer {}", token))
+                        .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
                         .send()
                         .await?;
                         
@@ -1151,7 +1212,7 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": self.version,
+            "version": "1.13.1",
             "byoc": byoc,
             "noFastEnable": no_fast_enable,
             "flavor": flavor,
@@ -1169,19 +1230,35 @@ impl Cluster {
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 发送port-check事件
-        info!("发送端口检查请求...");
-        match socket.emit("port-check", payload).await {
-            Ok(_) => info!("端口检查请求已发送"),
-            Err(e) => {
-                error!("发送端口检查请求失败: {}", e);
-                return Err(anyhow!("发送端口检查请求失败: {}", e));
-            }
+        // 创建回调函数
+        let ack_callback = move |message: Payload, _| {
+            async move {
+                info!("收到port-check响应回调");
+                match message {
+                    Payload::Text(values) => {
+                        info!("处理port-check响应的文本数据: {:?}", values);
+                        // 端口检查通常不需要处理响应数据，只需要确认服务器收到了请求
+                    },
+                    _ => error!("收到非文本格式的port-check响应: {:?}", message),
+                }
+            }.boxed()
         };
         
-        // 等待一段时间确保事件被服务器处理
+        // 发送port-check事件并等待回调
+        info!("发送端口检查请求...");
+        let res = socket
+            .emit_with_ack("port-check", payload, Duration::from_secs(10), ack_callback)
+            .await;
+            
+        if res.is_err() {
+            error!("发送端口检查请求失败: {:?}", res.err());
+            return Err(anyhow!("发送端口检查请求失败"));
+        }
+        
+        // 等待一段时间以确保回调有机会处理
         tokio::time::sleep(Duration::from_secs(2)).await;
         
+        info!("端口检查请求已完成");
         Ok(())
     }
 
@@ -1274,7 +1351,6 @@ impl Clone for Cluster {
             tmp_dir: self.tmp_dir.clone(),
             cert_key_files: self.cert_key_files.clone(),
             socket: self.socket.clone(),
-            socket_state: self.socket_state.clone(),
         }
     }
 }
@@ -1337,125 +1413,6 @@ async fn serve_file(
                 .unwrap()
         }
     }
-}
-
-// 测速处理函数
-async fn measure_handler(
-    Path(size): Path<u32>,
-    State(_cluster): State<Arc<Cluster>>,
-    req: Request<Body>,
-) -> impl IntoResponse {
-    // 检查请求是否带有合法签名
-    let query_params = req.uri().query().unwrap_or("");
-    let query_dict: HashMap<String, String> = query_params
-        .split('&')
-        .filter_map(|item| {
-            let split: Vec<&str> = item.split('=').collect();
-            if split.len() == 2 {
-                Some((split[0].to_string(), split[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // 从URL中提取sign参数
-    let sign = query_dict.get("sign");
-    if sign.is_none() {
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("Missing signature"))
-            .unwrap();
-    }
-
-    // 获取config的读锁
-    let config = CONFIG.read().unwrap();
-    
-    // 计算验证数据
-    let path = format!("/measure/{}", size);
-    
-    // 构建查询参数，确保包含必要的参数
-    if !crate::util::check_sign(&path, &config.cluster_secret, &query_dict) {
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("Invalid signature"))
-            .unwrap();
-    }
-
-    // 检查请求的大小是否合理
-    if size > 200 {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("Size too large"))
-            .unwrap();
-    }
-
-    // 生成指定大小的数据
-    let buffer_size = 1024 * 1024; // 1MB
-    let buffer = vec![0u8; buffer_size];
-
-    // 创建异步数据流
-    let stream = tokio_stream::iter(std::iter::repeat_with(move || {
-        Ok::<_, std::io::Error>(bytes::Bytes::from(buffer.clone()))
-    }).take(size as usize));
-
-    // 创建响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Length", (size as usize * buffer_size).to_string())
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-// 认证处理函数
-async fn auth_handler(req: Request<Body>) -> impl IntoResponse {
-    // 获取原始URL
-    let original_uri = req.headers().get("x-original-uri");
-    if original_uri.is_none() {
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("Missing original URI"))
-            .unwrap();
-    }
-    
-    let original_uri = original_uri.unwrap().to_str().unwrap_or("");
-    
-    // 解析URL
-    let url = match url::Url::parse(&format!("http://localhost{}", original_uri)) {
-        Ok(url) => url,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from("Invalid URI"))
-                .unwrap();
-        }
-    };
-    
-    // 从路径中提取hash
-    let path = url.path();
-    let hash = path.split('/').last().unwrap_or("");
-    
-    // 从查询参数中获取sign和过期时间
-    let query_params: HashMap<String, String> = url.query_pairs()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    
-    // 获取配置
-    let config = CONFIG.read().unwrap();
-    
-    // 验证签名
-    if !crate::util::check_sign(hash, &config.cluster_secret, &query_params) {
-        return Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(Body::from("Invalid signature"))
-            .unwrap();
-    }
-    
-    // 签名验证通过
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .unwrap()
 }
 
 // 尝试重新连接集群（未使用）

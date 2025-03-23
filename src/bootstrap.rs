@@ -60,7 +60,9 @@ pub async fn bootstrap(version: &str) -> Result<()> {
         }
     } else {
         info!("请求证书");
-        cluster.request_cert().await?;
+        if !cluster.request_cert().await {
+            return Err(anyhow!("请求证书失败"));
+        }
     }
     
     // 创建HTTP服务器

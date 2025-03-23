@@ -39,7 +39,7 @@ impl Keepalive {
                     match &*guard {
                         Some(cluster) => cluster.clone(),
                         None => {
-                            debug!("等待集群实例初始化...");
+                            debug!("等待节点实例初始化...");
                             continue;
                         }
                     }
@@ -48,7 +48,7 @@ impl Keepalive {
                 debug!("发送心跳");
                 
                 if !cluster.is_enabled().await {
-                    debug!("集群未启用，跳过心跳");
+                    debug!("节点未启用，跳过心跳");
                     continue;
                 }
                 
@@ -57,7 +57,7 @@ impl Keepalive {
                     
                     // 如果心跳失败但希望启用，尝试重新启用
                     if cluster.want_enable().await {
-                        info!("尝试重新启用集群");
+                        info!("尝试重新启用节点");
                         if let Err(e) = cluster.enable().await {
                             error!("重新启用失败: {}", e);
                         }

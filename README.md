@@ -51,8 +51,8 @@ docker run -d \
 
 - `-p 4000:4000`: 将容器的4000端口映射到主机的4000端口
 - `-v $(pwd)/cache:/app/cache`: 将主机当前目录下的cache文件夹挂载到容器内的/app/cache目录
-- `-e CLUSTER_ID`: 设置集群ID环境变量
-- `-e CLUSTER_SECRET`: 设置集群密钥环境变量
+- `-e CLUSTER_ID`: 设置节点ID环境变量
+- `-e CLUSTER_SECRET`: 设置节点密钥环境变量
 - `-e BMCLAPI_CACHE_DIR`: 设置数据目录位置（可选，默认为 ./cache）
 
 您也可以使用docker-compose:
@@ -112,8 +112,8 @@ Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过
 
 主要配置项：
 
-- `CLUSTER_ID`：集群ID，从BMCLAPI获取
-- `CLUSTER_SECRET`：集群密钥，从BMCLAPI获取
+- `CLUSTER_ID`：节点ID，从BMCLAPI获取
+- `CLUSTER_SECRET`：节点密钥，从BMCLAPI获取
 - `CLUSTER_IP`：可选，服务器公网IP，不设置会自动获取
 - `CLUSTER_PORT`：服务监听端口，默认4000
 - `CLUSTER_PUBLIC_PORT`：公网访问端口，默认与CLUSTER_PORT相同

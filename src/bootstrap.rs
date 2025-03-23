@@ -29,7 +29,7 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     // 获取令牌（初始化）
     token_manager.get_token().await?;
     
-    // 创建并初始化集群
+    // 创建并初始化节点
     let cluster = Cluster::new(version, token_manager.clone())?;
     cluster.init().await?;
     
@@ -111,12 +111,12 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     // 进行端口检查
     info!("检查端口可达性...");
     if let Err(e) = cluster.port_check().await {
-        warn!("端口检查失败: {}，这可能影响集群的可用性", e);
+        warn!("端口检查失败: {}，这可能影响节点的可用性", e);
     } else {
         info!("端口检查成功");
     }
     
-    // 启用集群
+    // 启用节点
     info!("请求上线...");
     cluster.enable().await?;
     
@@ -177,9 +177,9 @@ pub async fn bootstrap(version: &str) -> Result<()> {
         Ok(()) => {
             info!("收到终止信号，开始关闭服务...");
             
-            // 禁用集群
+            // 禁用节点
             if let Err(e) = cluster.disable().await {
-                error!("禁用集群失败: {}", e);
+                error!("禁用节点失败: {}", e);
             }
             
             // 等待服务器优雅关闭

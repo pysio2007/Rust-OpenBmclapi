@@ -596,7 +596,7 @@ impl Cluster {
             debug!("已设置 want_enable = true");
         }
         
-        info!("开始启用集群节点...");
+        info!("开始启用节点节点...");
         
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
@@ -662,7 +662,7 @@ impl Cluster {
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
                                            inner_inner_array[1].as_bool().unwrap_or(false) {
-                                            info!("节点注册成功，等待集群启用 ");
+                                            info!("节点注册成功，等待节点启用 ");
                                             let _ = tx.send(Ok(())).await;
                                             return;
                                         }
@@ -675,7 +675,7 @@ impl Cluster {
                         let values = values.to_vec();
                         
                         if values.len() < 2 {
-                            let err = "启用集群响应格式错误: 数组长度不足";
+                            let err = "启用节点响应格式错误: 数组长度不足";
                             error!("{} (期望>=2, 实际={})", err, values.len());
                             let _ = tx.send(Err(anyhow!(err))).await;
                             return;
@@ -703,7 +703,7 @@ impl Cluster {
                             return;
                         }
                         
-                        info!("节点注册成功，等待集群启用");
+                        info!("节点注册成功，等待节点启用");
                         let _ = tx.send(Ok(())).await;
                     },
                     _ => {
@@ -829,7 +829,7 @@ impl Cluster {
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
                                            inner_inner_array[1].as_bool().unwrap_or(false) {
-                                            info!("集群已成功禁用 ");
+                                            info!("节点已成功禁用 ");
                                             let mut is_enabled_guard = is_enabled.write().unwrap();
                                             *is_enabled_guard = false;
                                             return;
@@ -840,16 +840,16 @@ impl Cluster {
                         }
                         
                         if values.len() < 2 {
-                            error!("禁用集群响应格式错误: 数组长度不足");
+                            error!("禁用节点响应格式错误: 数组长度不足");
                             return;
                         }
                         
                         if !values[0].is_null() {
                             if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
-                                error!("禁用集群失败: {}", err_msg);
+                                error!("禁用节点失败: {}", err_msg);
                                 return;
                             } else {
-                                error!("禁用集群失败: {:?}", values[0]);
+                                error!("禁用节点失败: {:?}", values[0]);
                                 return;
                             }
                         }
@@ -862,7 +862,7 @@ impl Cluster {
                         {
                             let mut is_enabled_guard = is_enabled.write().unwrap();
                             *is_enabled_guard = false;
-                            info!("集群已成功禁用");
+                            info!("节点已成功禁用");
                         }
                     },
                     _ => error!("收到非文本格式的disable响应: {:?}", message),
@@ -957,23 +957,23 @@ impl Cluster {
                     
                     let is_enabled = *cluster.is_enabled.read().unwrap();
                     let want_enable = *cluster.want_enable.read().unwrap();
-                    info!("当前集群状态 - 是否启用: {}, 是否希望启用: {}", is_enabled, want_enable);
+                    info!("当前节点状态 - 是否启用: {}, 是否希望启用: {}", is_enabled, want_enable);
                     
                     if *cluster.want_enable.read().unwrap() && !*cluster.is_enabled.read().unwrap() {
-                        info!("检测到连接重新建立，且want_enable=true但is_enabled=false，将尝试重新启用集群");
+                        info!("检测到连接重新建立，且want_enable=true但is_enabled=false，将尝试重新启用节点");
                         let cluster_clone = cluster.clone();
                         tokio::spawn(async move {
-                            info!("开始尝试重新启用集群...");
+                            info!("开始尝试重新启用节点...");
                             if let Err(e) = cluster_clone.enable().await {
-                                error!("自动重新启用集群失败: {}, 错误详情: {:?}", e, e);
+                                error!("自动重新启用节点失败: {}, 错误详情: {:?}", e, e);
                             } else {
-                                info!("集群已成功重新启用");
+                                info!("节点已成功重新启用");
                             }
                         });
                     } else if *cluster.want_enable.read().unwrap() && *cluster.is_enabled.read().unwrap() {
-                        info!("集群当前状态正常 (want_enable=true, is_enabled=true)，无需执行额外操作");
+                        info!("节点当前状态正常 (want_enable=true, is_enabled=true)，无需执行额外操作");
                     } else if !*cluster.want_enable.read().unwrap() {
-                        info!("集群当前不希望启用 (want_enable=false)，不会尝试重新启用");
+                        info!("节点当前不希望启用 (want_enable=false)，不会尝试重新启用");
                     }
                 }.boxed()
             }
@@ -1039,7 +1039,7 @@ impl Cluster {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     
                     if !*want_enable.read().unwrap() {
-                        debug!("集群已不再需要连接，取消重连");
+                        debug!("节点已不再需要连接，取消重连");
                         return;
                     }
                     
@@ -1065,120 +1065,6 @@ impl Cluster {
                 });
                 
                 Err(anyhow!("Socket.IO连接失败: {}", e))
-            }
-        }
-    }
-    
-    async fn start_keepalive_task(&self) {
-        info!("启动 keepalive 任务");
-        
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        let mut failed_keepalive = 0;
-        
-        loop {
-            interval.tick().await;
-            
-            // 检查集群是否希望启用自己
-            if !self.want_enable().await {
-                debug!("集群不希望启用，跳过 keepalive");
-                continue;
-            }
-            
-            debug!("发送 keepalive");
-            
-            // 如果不是已启用状态，尝试重新上线
-            if !self.is_enabled().await {
-                info!("集群状态为离线，尝试重新连接");
-                if let Err(e) = self.try_reconnect().await {
-                    error!("尝试重新连接失败: {}", e);
-                    failed_keepalive += 1;
-                    
-                    if failed_keepalive >= 5 {
-                        error!("重连失败次数过多 ({}次)，降低重连频率", failed_keepalive);
-                        // 降低重连频率，避免频繁请求
-                        interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟重试一次
-                    }
-                    continue;
-                } else {
-                    info!("重新连接成功，恢复正常心跳频率");
-                    // 恢复正常心跳频率
-                    interval = tokio::time::interval(Duration::from_secs(60));
-                    failed_keepalive = 0;
-                }
-            }
-            
-            // 发送心跳
-            match self.send_heartbeat().await {
-                Ok(_) => {
-                    if failed_keepalive > 0 {
-                        info!("keep-alive发送成功，重置失败计数 (之前失败次数: {})", failed_keepalive);
-                        // 恢复正常心跳频率
-                        interval = tokio::time::interval(Duration::from_secs(60));
-                        failed_keepalive = 0;
-                    }
-                },
-                Err(e) => {
-                    failed_keepalive += 1;
-                    error!("keep-alive发送失败 (第{}次): {} (原因: {})", 
-                        failed_keepalive, e, e);
-                    
-                    if failed_keepalive >= 3 {
-                        error!("keep-alive连续失败{}次，尝试重新连接", failed_keepalive);
-                        // 尝试重新连接
-                        match self.try_reconnect().await {
-                            Ok(_) => {
-                                info!("重新连接成功");
-                                failed_keepalive = 0;
-                            },
-                            Err(e) => {
-                                error!("重新连接失败: {}", e);
-                                // 如果重连也失败，降低心跳频率
-                                if failed_keepalive >= 5 {
-                                    warn!("降低心跳频率，避免频繁请求");
-                                    interval = tokio::time::interval(Duration::from_secs(300)); // 5分钟
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    /// 尝试重新连接服务器
-    async fn try_reconnect(&self) -> Result<()> {
-        info!("尝试重新连接服务器...");
-        
-        // 1. 尝试重新建立Socket.IO连接
-        if let Err(e) = self.connect().await {
-            error!("Socket.IO连接失败: {}", e);
-            return Err(anyhow!("Socket.IO连接失败: {}", e));
-        }
-        
-        // 2. 如果使用HTTPS，检查证书
-        let config = CONFIG.read().unwrap().clone();
-        if config.byoc {
-            if config.ssl_cert.is_some() && config.ssl_key.is_some() {
-                if let Err(e) = self.use_self_cert().await {
-                    error!("使用自定义证书失败: {}", e);
-                    return Err(anyhow!("使用自定义证书失败: {}", e));
-                }
-            }
-        } else {
-            if !self.request_cert().await {
-                return Err(anyhow!("请求证书失败"));
-            }
-        }
-        
-        // 3. 尝试重新启用集群
-        match self.enable().await {
-            Ok(_) => {
-                info!("集群重新启用成功");
-                Ok(())
-            },
-            Err(e) => {
-                error!("集群重新启用失败: {}", e);
-                Err(anyhow!("集群重新启用失败: {}", e))
             }
         }
     }
@@ -2158,27 +2044,6 @@ async fn serve_file(
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(format!("处理请求失败: {}", e)))
                 .unwrap()
-        }
-    }
-}
-
-#[allow(dead_code)]
-async fn try_reconnect(cluster: &Cluster) -> Result<(), anyhow::Error> {
-    if !*cluster.want_enable.read().unwrap() {
-        return Ok(());
-    }
-    
-    info!("尝试重新连接服务器...");
-    
-    match cluster.connect().await {
-        Ok(_) => {
-            info!("集群连接已恢复");
-            
-            Ok(())
-        },
-        Err(e) => {
-            error!("重新连接失败: {}", e);
-            Err(anyhow!("重新连接失败: {}", e))
         }
     }
 }

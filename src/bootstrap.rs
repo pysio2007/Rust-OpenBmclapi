@@ -108,11 +108,6 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     
     info!("{}", format!("服务完成初始化，共 {} 个文件", files.files.len()).green());
     
-    // 如果是工作进程，向主进程发送准备好的信号
-    if let Some(worker_id) = crate::cluster_manager::get_worker_id() {
-        info!("工作进程 {} 准备就绪", worker_id);
-    }
-    
     // 设置文件检查定时器
     let check_file_interval = Duration::from_secs(600); // 10分钟
     let mut last_files = files;

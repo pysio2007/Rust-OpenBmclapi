@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::path::Path;
+use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFlavor {
@@ -43,9 +45,49 @@ pub struct Config {
 }
 
 impl Config {
+    // 创建默认的.env文件模板（如果不存在）
+    fn create_default_env_file() -> Result<()> {
+        let env_path = ".env";
+        if !Path::new(env_path).exists() {
+            let env_content = 
+                "# 请填写以下必要配置项\n\
+                 NO_DAEMON=1\n\
+                 # 请替换为你的CLUSTER_ID（必填）\n\
+                 CLUSTER_ID=\n\
+                 # 请替换为你的CLUSTER_SECRET（必填）\n\
+                 CLUSTER_SECRET=\n\
+                 # CLUSTER_IP=请设置你的公网IP或内网IP\n\
+                 # CLUSTER_PORT=4000\n\
+                 # ENABLE_UPNP=false\n\
+                 # ENABLE_METRICS=false\n";
+            
+            fs::write(env_path, env_content)?;
+            info!("已创建.env文件模板，请填写必要的配置项");
+        }
+        Ok(())
+    }
+
     pub fn new() -> Result<Self> {
-        let cluster_id = env::var("CLUSTER_ID").expect("CLUSTER_ID环境变量必须设置");
-        let cluster_secret = env::var("CLUSTER_SECRET").expect("CLUSTER_SECRET环境变量必须设置");
+        // 尝试创建默认的.env文件模板
+        Self::create_default_env_file()?;
+        
+        // 默认为单进程模式
+        env::set_var("NO_DAEMON", "1");
+        
+        let cluster_id = match env::var("CLUSTER_ID") {
+            Ok(id) if !id.trim().is_empty() => id,
+            _ => {
+                return Err(anyhow::anyhow!("CLUSTER_ID环境变量未设置或为空，请在.env文件中填写必要的配置项"));
+            }
+        };
+        
+        let cluster_secret = match env::var("CLUSTER_SECRET") {
+            Ok(secret) if !secret.trim().is_empty() => secret,
+            _ => {
+                return Err(anyhow::anyhow!("CLUSTER_SECRET环境变量未设置或为空，请在.env文件中填写必要的配置项"));
+            }
+        };
+        
         let cluster_ip = env::var("CLUSTER_IP").ok();
         
         let port_str = env::var("CLUSTER_PORT").unwrap_or_else(|_| "4000".to_string());

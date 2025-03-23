@@ -1,18 +1,21 @@
 use anyhow::{anyhow, Result};
-use axum::{
-    extract::{Path, State, Query},
-    routing::get,
-    Router,
-    body::Body,
-    http::{Request, Response, StatusCode},
-    response::IntoResponse,
-};
+use axum::body::Body;
+use axum::{response::Response, routing::get, Router};
+use axum::extract::{Query, State, Path};
+use axum::http::{StatusCode, Request};
+use axum::response::IntoResponse;
 use reqwest::Client;
-use log::{debug, error, info, warn};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use futures::FutureExt;
+use rust_socketio::{
+    asynchronous::{Client as SocketClient, ClientBuilder},
+    Payload, TransportType,
+};
 
 use crate::config::CONFIG;
 use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
@@ -115,30 +118,86 @@ impl Cluster {
     pub async fn request_cert(&self) -> Result<()> {
         info!("正在向服务器请求证书...");
         
-        // 构建请求URL
-        let url = format!("{}/openbmclapi/cert/request", self.base_url);
-        let token = self.token_manager.get_token().await?;
+        // 创建通道，用于接收证书响应
+        let (cert_result_tx, cert_result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
+        let cert_result_tx = Arc::new(tokio::sync::Mutex::new(Some(cert_result_tx)));
         
-        // 发送证书请求
-        let response = self.client.post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await?;
-            
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await?;
-            error!("请求证书失败: {} - {}", status, text);
-            return Err(anyhow!("请求证书失败: {} - {}", status, text));
+        // 创建一个新的Socket.IO客户端，以便注册回调处理证书请求
+        let mut socket_builder = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket);
+        
+        // 注册回调
+        socket_builder = socket_builder.on("request-cert", {
+            let cert_result_tx = cert_result_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let cert_result_tx = cert_result_tx.clone();
+                async move {
+                    info!("收到证书响应");
+                    
+                    // 尝试发送证书数据到通道
+                    match payload {
+                        Payload::Text(values) => {
+                            if let Some(tx) = cert_result_tx.lock().await.take() {
+                                let _ = tx.send(values);
+                            }
+                        },
+                        Payload::Binary(bin_data) => {
+                            error!("收到意外的二进制数据: {:?}", bin_data);
+                        },
+                        _ => {
+                            error!("证书响应格式错误: {:?}", payload);
+                        }
+                    }
+                }.boxed()
+            }
+        });
+        
+        // 连接并获取客户端
+        let socket = socket_builder.connect().await?;
+        
+        // 认证
+        let token = self.token_manager.get_token().await?;
+        socket.emit("auth", json!({"token": token})).await?;
+        
+        // 等待认证完成
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 请求证书
+        info!("正在请求证书...");
+        socket.emit("request-cert", json!({})).await?;
+        
+        // 等待响应，最多等待10秒
+        let cert_array = match tokio::time::timeout(
+            Duration::from_secs(10), 
+            cert_result_rx
+        ).await {
+            Ok(Ok(data)) => data,
+            Ok(Err(e)) => return Err(anyhow!("接收证书响应失败: {}", e)),
+            Err(_) => return Err(anyhow!("请求证书超时")),
+        };
+        
+        // 检查数组长度
+        if cert_array.len() < 2 {
+            return Err(anyhow!("证书响应格式错误: 数组长度不足"));
         }
         
-        // 解析证书响应
-        let cert_response: serde_json::Value = response.json().await?;
-        let cert = cert_response["cert"].as_str()
+        // 检查第一个元素是否为错误对象
+        if !cert_array[0].is_null() {
+            return Err(anyhow!("请求证书失败: {:?}", cert_array[0]));
+        }
+        
+        // 从第二个元素中提取证书和密钥
+        let cert_data = &cert_array[1];
+        
+        // 提取证书和密钥
+        let cert = cert_data.get("cert")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("服务器返回的证书格式不正确"))?;
-        let key = cert_response["key"].as_str()
+        
+        let key = cert_data.get("key")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("服务器返回的密钥格式不正确"))?;
-            
+        
         // 保存证书和密钥到临时目录
         let cert_path = self.tmp_dir.join("cert.pem");
         let key_path = self.tmp_dir.join("key.pem");
@@ -153,6 +212,9 @@ impl Cluster {
             let mut cert_files = self.cert_key_files.write().unwrap();
             *cert_files = Some((cert_path, key_path));
         }
+        
+        // 关闭socket连接
+        socket.disconnect().await?;
         
         Ok(())
     }
@@ -356,17 +418,22 @@ impl Cluster {
     }
     
     pub async fn enable(&self) -> Result<()> {
+        // 检查是否已启用
+        if *self.is_enabled.read().unwrap() {
+            return Ok(());
+        }
+        
+        // 设置状态为希望启用
         {
             let mut want_enable = self.want_enable.write().unwrap();
             *want_enable = true;
         }
         
         // 获取主机IP
-        let host = match &self.host {
-            Some(h) => h.clone(),
+        let public_ip = match self.host {
+            Some(ref h) => h.clone(),
             None => {
-                if let Ok(ip) = find_public_ip().await {
-                    info!("获取到公网IP: {}", ip);
+                if let Ok(ip) = Self::find_public_ip().await {
                     ip
                 } else {
                     return Err(anyhow!("无法获取公网IP"));
@@ -374,102 +441,250 @@ impl Cluster {
             }
         };
         
-        // 构建URL
-        let url = format!("{}/openbmclapi/clusters/register", self.base_url);
+        // 在await之前获取CONFIG中需要的值，避免在await点跨越持有锁
+        let byoc = {
+            let config = CONFIG.read().unwrap();
+            config.byoc
+        };
         
-        // 构建请求体
-        let mut body = HashMap::new();
-        body.insert("host", host);
-        body.insert("port", self.public_port.to_string());
-        body.insert("flavor", serde_json::to_string(&CONFIG.read().unwrap().flavor)?);
+        let flavor = {
+            let config = CONFIG.read().unwrap();
+            config.flavor.clone()
+        };
         
-        let token = self.token_manager.get_token().await?;
+        let no_fast_enable = std::env::var("NO_FAST_ENABLE").unwrap_or_else(|_| "false".to_string()) == "true";
         
-        // 发送请求
-        let response = self.client.post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&body)
-            .send()
-            .await?;
-            
-        if response.status().is_success() {
-            info!("集群已启用");
-            {
-                let mut is_enabled = self.is_enabled.write().unwrap();
-                *is_enabled = true;
+        // 构建请求参数
+        let payload = json!({
+            "host": public_ip,
+            "port": self.public_port,
+            "version": self.version,
+            "byoc": byoc,
+            "noFastEnable": no_fast_enable,
+            "flavor": flavor,
+        });
+        
+        // 创建通道来接收应答
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
+        let result_tx = Arc::new(tokio::sync::Mutex::new(Some(result_tx)));
+        
+        // 创建新的Socket.IO客户端并注册回调
+        let mut socket_builder = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket);
+        
+        // 注册回调
+        socket_builder = socket_builder.on("enable", {
+            let result_tx = result_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let result_tx = result_tx.clone();
+                async move {
+                    if let Some(tx) = result_tx.lock().await.take() {
+                        match payload {
+                            Payload::Text(values) => {
+                                let _ = tx.send(values);
+                            },
+                            _ => {
+                                error!("启用集群响应格式错误");
+                            }
+                        }
+                    }
+                }.boxed()
             }
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await?;
-            error!("启用集群失败: {} - {}", status, text);
-            Err(anyhow!("启用集群失败: {} - {}", status, text))
+        });
+        
+        // 连接并获取客户端
+        let socket = socket_builder.connect().await?;
+        
+        // 认证
+        let token = self.token_manager.get_token().await?;
+        socket.emit("auth", json!({"token": token})).await?;
+        
+        // 等待认证完成
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 发送enable事件
+        socket.emit("enable", payload).await?;
+        
+        // 等待响应，最多等待5分钟
+        let timeout_duration = Duration::from_secs(300); // 5分钟
+        let result = match tokio::time::timeout(
+            timeout_duration,
+            result_rx
+        ).await {
+            Ok(Ok(values)) => values,
+            Ok(Err(e)) => return Err(anyhow!("接收启用响应失败: {}", e)),
+            Err(_) => return Err(anyhow!("节点注册超时")),
+        };
+        
+        // 检查结果
+        if result.len() < 2 {
+            return Err(anyhow!("启用集群响应格式错误: 数组长度不足"));
         }
+        
+        // 检查错误
+        if !result[0].is_null() {
+            if let Some(err_msg) = result[0].get("message").and_then(|v| v.as_str()) {
+                return Err(anyhow!(err_msg.to_string()));
+            } else {
+                return Err(anyhow!("启用集群失败: {:?}", result[0]));
+            }
+        }
+        
+        // 检查确认
+        if result[1].as_bool() != Some(true) {
+            return Err(anyhow!("节点注册失败"));
+        }
+        
+        // 设置状态为已启用
+        {
+            let mut is_enabled = self.is_enabled.write().unwrap();
+            *is_enabled = true;
+        }
+        
+        // 断开连接
+        socket.disconnect().await?;
+        
+        info!("集群已成功启用");
+        Ok(())
     }
     
     pub async fn disable(&self) -> Result<()> {
+        // 检查是否已禁用
         if !*self.is_enabled.read().unwrap() {
             return Ok(());
         }
         
+        // 设置状态为不希望启用
         {
             let mut want_enable = self.want_enable.write().unwrap();
             *want_enable = false;
         }
         
-        let url = format!("{}/openbmclapi/clusters/unregister", self.base_url);
-        let token = self.token_manager.get_token().await?;
+        // 创建通道来接收应答
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
+        let result_tx = Arc::new(tokio::sync::Mutex::new(Some(result_tx)));
         
-        let response = self.client.post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await?;
+        // 创建新的Socket.IO客户端并注册回调
+        let mut socket_builder = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket);
             
-        if response.status().is_success() {
-            info!("集群已禁用");
-            {
-                let mut is_enabled = self.is_enabled.write().unwrap();
-                *is_enabled = false;
+        // 注册回调
+        socket_builder = socket_builder.on("disable", {
+            let result_tx = result_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let result_tx = result_tx.clone();
+                async move {
+                    if let Some(tx) = result_tx.lock().await.take() {
+                        match payload {
+                            Payload::Text(values) => {
+                                let _ = tx.send(values);
+                            },
+                            _ => {
+                                error!("禁用集群响应格式错误");
+                            }
+                        }
+                    }
+                }.boxed()
             }
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await?;
-            error!("禁用集群失败: {} - {}", status, text);
-            Err(anyhow!("禁用集群失败: {} - {}", status, text))
+        });
+        
+        // 连接并获取客户端
+        let socket = socket_builder.connect().await?;
+        
+        // 认证
+        let token = self.token_manager.get_token().await?;
+        socket.emit("auth", json!({"token": token})).await?;
+        
+        // 等待认证完成
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 发送disable事件
+        socket.emit("disable", json!(null)).await?;
+        
+        // 等待响应
+        let result = match tokio::time::timeout(
+            Duration::from_secs(30),
+            result_rx
+        ).await {
+            Ok(Ok(values)) => values,
+            Ok(Err(e)) => return Err(anyhow!("接收禁用响应失败: {}", e)),
+            Err(_) => return Err(anyhow!("禁用集群超时")),
+        };
+        
+        // 检查结果
+        if result.len() < 2 {
+            return Err(anyhow!("禁用集群响应格式错误: 数组长度不足"));
         }
+        
+        // 检查错误
+        if !result[0].is_null() {
+            if let Some(err_msg) = result[0].get("message").and_then(|v| v.as_str()) {
+                return Err(anyhow!(err_msg.to_string()));
+            } else {
+                return Err(anyhow!("禁用集群失败: {:?}", result[0]));
+            }
+        }
+        
+        // 检查确认
+        if result[1].as_bool() != Some(true) {
+            return Err(anyhow!("节点禁用失败"));
+        }
+        
+        // 设置状态为已禁用
+        {
+            let mut is_enabled = self.is_enabled.write().unwrap();
+            *is_enabled = false;
+        }
+        
+        // 断开连接
+        socket.disconnect().await?;
+        
+        info!("集群已成功禁用");
+        Ok(())
     }
     
     pub async fn send_heartbeat(&self) -> Result<()> {
         if !*self.is_enabled.read().unwrap() {
+            debug!("集群未启用，跳过心跳");
             return Ok(());
         }
         
-        let url = format!("{}/openbmclapi/clusters/heartbeat", self.base_url);
-        let token = self.token_manager.get_token().await?;
-        
-        // 获取计数器
+        // 获取计数器并克隆，避免长时间持有锁
         let counters = self.counters.read().unwrap().clone();
         
-        // 构建请求体
-        let mut body = HashMap::new();
-        body.insert("hits", counters.hits.to_string());
-        body.insert("bytes", counters.bytes.to_string());
+        // 构建请求参数
+        let payload = json!({
+            "hits": counters.hits,
+            "bytes": counters.bytes,
+        });
         
-        let response = self.client.post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&body)
-            .send()
+        // 创建新的Socket.IO客户端
+        let socket = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket)
+            .connect()
             .await?;
             
-        if response.status().is_success() {
-            debug!("发送心跳成功");
-            Ok(())
-        } else {
-            let status = response.status();
-            let text = response.text().await?;
-            error!("发送心跳失败: {} - {}", status, text);
-            Err(anyhow!("发送心跳失败: {} - {}", status, text))
+        // 认证
+        let token = self.token_manager.get_token().await?;
+        socket.emit("auth", json!({"token": token})).await?;
+        
+        // 等待认证完成
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 发送心跳事件
+        match socket.emit("heartbeat", payload).await {
+            Ok(_) => {
+                debug!("发送心跳成功");
+                // 断开连接
+                let _ = socket.disconnect().await;
+                Ok(())
+            },
+            Err(e) => {
+                error!("发送心跳失败: {}", e);
+                // 断开连接
+                let _ = socket.disconnect().await;
+                Err(anyhow!("发送心跳失败: {}", e))
+            }
         }
     }
     
@@ -648,6 +863,126 @@ impl Cluster {
     pub fn get_storage(&self) -> Arc<Box<dyn Storage>> {
         self.storage.clone()
     }
+
+    // 端口检查方法，与Node.js版本保持一致
+    pub async fn port_check(&self) -> Result<()> {
+        let host = self.host.clone().unwrap_or_else(|| "".to_string());
+        
+        // 在await之前获取CONFIG中需要的值，避免在await点跨越持有锁
+        let byoc = {
+            let config = CONFIG.read().unwrap();
+            config.byoc
+        };
+        
+        let flavor = {
+            let config = CONFIG.read().unwrap();
+            config.flavor.clone()
+        };
+        
+        let no_fast_enable = std::env::var("NO_FAST_ENABLE").unwrap_or_else(|_| "false".to_string()) == "true";
+        
+        let payload = json!({
+            "host": host,
+            "port": self.public_port,
+            "version": self.version,
+            "byoc": byoc,
+            "noFastEnable": no_fast_enable,
+            "flavor": flavor,
+        });
+
+        // 创建新的Socket.IO客户端
+        let socket = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket)
+            .connect()
+            .await?;
+            
+        // 认证
+        let token = self.token_manager.get_token().await?;
+        socket.emit("auth", json!({"token": token})).await?;
+        
+        // 等待认证完成
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 发送port-check事件
+        socket.emit("port-check", payload).await?;
+        
+        // 等待一段时间确保事件被服务器处理
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        
+        // 断开连接
+        socket.disconnect().await?;
+        
+        Ok(())
+    }
+
+    // 寻找公网IP的辅助函数
+    async fn find_public_ip() -> Result<String> {
+        // 首先检查是否启用UPnP及获取端口配置
+        let enable_upnp = {
+            let config = CONFIG.read().unwrap();
+            config.enable_upnp
+        };
+        
+        let (port, public_port) = {
+            let config = CONFIG.read().unwrap();
+            (config.port, config.cluster_public_port)
+        };
+        
+        // 尝试通过UPnP获取
+        if enable_upnp {
+            info!("尝试通过UPnP获取公网IP...");
+            match upnp::setup_upnp(port, public_port).await {
+                Ok(ip) => {
+                    info!("成功通过UPnP获取公网IP: {}", ip);
+                    return Ok(ip);
+                },
+                Err(e) => {
+                    warn!("UPnP获取公网IP失败: {}", e);
+                    warn!("将尝试使用在线IP查询服务获取公网IP");
+                    // 继续尝试其他方法
+                }
+            }
+        } else {
+            info!("UPnP功能未启用，将尝试使用在线IP查询服务获取公网IP");
+        }
+        
+        // 使用IP查询服务
+        let ip_services = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "https://icanhazip.com",
+        ];
+        
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+        
+        for service in ip_services {
+            info!("尝试从 {} 获取公网IP...", service);
+            match client.get(service).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        if let Ok(ip) = response.text().await {
+                            let ip = ip.trim();
+                            if !ip.is_empty() {
+                                info!("成功从 {} 获取公网IP: {}", service, ip);
+                                return Ok(ip.to_string());
+                            }
+                        }
+                    } else {
+                        warn!("从 {} 获取IP失败，HTTP状态码: {}", service, response.status());
+                    }
+                },
+                Err(e) => {
+                    warn!("从 {} 获取IP失败: {}", service, e);
+                    continue;
+                }
+            }
+        }
+        
+        error!("无法通过任何方式获取公网IP");
+        Err(anyhow!("无法获取公网IP，请手动在配置中指定CLUSTER_IP"))
+    }
 }
 
 // 克隆实现
@@ -729,67 +1064,6 @@ async fn serve_file(
                 .unwrap()
         }
     }
-}
-
-// 寻找公网IP的辅助函数
-async fn find_public_ip() -> Result<String> {
-    // 首先尝试通过UPnP获取
-    if CONFIG.read().unwrap().enable_upnp {
-        let port = CONFIG.read().unwrap().port;
-        let public_port = CONFIG.read().unwrap().cluster_public_port;
-        
-        info!("尝试通过UPnP获取公网IP...");
-        match upnp::setup_upnp(port, public_port).await {
-            Ok(ip) => {
-                info!("成功通过UPnP获取公网IP: {}", ip);
-                return Ok(ip);
-            },
-            Err(e) => {
-                warn!("UPnP获取公网IP失败: {}", e);
-                warn!("将尝试使用在线IP查询服务获取公网IP");
-                // 继续尝试其他方法
-            }
-        }
-    } else {
-        info!("UPnP功能未启用，将尝试使用在线IP查询服务获取公网IP");
-    }
-    
-    // 使用IP查询服务
-    let ip_services = [
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
-    ];
-    
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
-    
-    for service in ip_services {
-        info!("尝试从 {} 获取公网IP...", service);
-        match client.get(service).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    if let Ok(ip) = response.text().await {
-                        let ip = ip.trim();
-                        if !ip.is_empty() {
-                            info!("成功从 {} 获取公网IP: {}", service, ip);
-                            return Ok(ip.to_string());
-                        }
-                    }
-                } else {
-                    warn!("从 {} 获取IP失败，HTTP状态码: {}", service, response.status());
-                }
-            },
-            Err(e) => {
-                warn!("从 {} 获取IP失败: {}", service, e);
-                continue;
-            }
-        }
-    }
-    
-    error!("无法通过任何方式获取公网IP");
-    Err(anyhow!("无法获取公网IP，请手动在配置中指定CLUSTER_IP"))
 }
 
 // 测速处理函数

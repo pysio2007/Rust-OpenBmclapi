@@ -20,6 +20,7 @@ dotenv = "0.15"
 config = "0.13"
 clap = { version = "4.4", features = ["derive"] }
 futures = "0.3"
+futures-util = "0.3"
 bytes = "1.5"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -46,6 +47,8 @@ lazy_static = "1.4"
 url = "2.4"
 winapi = { version = "0.3", features = ["processthreadsapi", "handleapi"] }
 num_cpus = "1.16"
+# Socket.IO客户端
+rust_socketio = { version = "0.6.0", features = ["async"] }
 # SSL和HTTPS相关依赖
 hyper-rustls = "0.25"
 rustls = "0.22"

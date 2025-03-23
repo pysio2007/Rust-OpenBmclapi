@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use colored::Colorize;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,6 +101,14 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     // 垃圾回收
     info!("启动垃圾回收...");
     cluster.gc_background(&files).await?;
+    
+    // 进行端口检查
+    info!("检查端口可达性...");
+    if let Err(e) = cluster.port_check().await {
+        warn!("端口检查失败: {}，这可能影响集群的可用性", e);
+    } else {
+        info!("端口检查成功");
+    }
     
     // 启用集群
     info!("请求上线...");

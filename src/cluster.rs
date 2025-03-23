@@ -653,6 +653,24 @@ impl Cluster {
                     Payload::Text(values) => {
                         debug!("处理enable响应的文本数据: {:?}", values);
                         
+                        // 处理可能的嵌套数组格式 [Array [Array [Null, Bool(true)]]]
+                        if values.len() == 1 && values[0].is_array() {
+                            if let Some(inner_array) = values[0].as_array() {
+                                if inner_array.len() == 1 && inner_array[0].is_array() {
+                                    if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        if inner_inner_array.len() >= 2 && 
+                                           inner_inner_array[0].is_null() && 
+                                           inner_inner_array[1].is_boolean() && 
+                                           inner_inner_array[1].as_bool().unwrap_or(false) {
+                                            info!("节点注册成功，等待集群启用 ");
+                                            let _ = tx.send(Ok(())).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         // 克隆整个values数组以避免生命周期问题
                         let values = values.to_vec();
                         
@@ -801,6 +819,25 @@ impl Cluster {
                 match message {
                     Payload::Text(values) => {
                         debug!("处理disable响应的文本数据: {:?}", values);
+                        
+                        // 处理可能的嵌套数组格式 [Array [Array [Null, Bool(true)]]]
+                        if values.len() == 1 && values[0].is_array() {
+                            if let Some(inner_array) = values[0].as_array() {
+                                if inner_array.len() == 1 && inner_array[0].is_array() {
+                                    if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        if inner_inner_array.len() >= 2 && 
+                                           inner_inner_array[0].is_null() && 
+                                           inner_inner_array[1].is_boolean() && 
+                                           inner_inner_array[1].as_bool().unwrap_or(false) {
+                                            info!("集群已成功禁用 ");
+                                            let mut is_enabled_guard = is_enabled.write().unwrap();
+                                            *is_enabled_guard = false;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         
                         if values.len() < 2 {
                             error!("禁用集群响应格式错误: 数组长度不足");
@@ -1774,7 +1811,7 @@ impl Cluster {
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
                                            inner_inner_array[1].as_bool().unwrap_or(false) {
-                                            info!("端口检查成功 (嵌套数组格式)");
+                                            info!("端口检查成功 ");
                                             let _ = tx.send(Ok(())).await;
                                             return;
                                         }
@@ -1998,16 +2035,29 @@ async fn serve_file(
                         .unwrap_or(0)
                 };
                 
+                if content_length == 0 {
+                    warn!("无法处理Range请求: 响应中未包含有效的Content-Length头");
+                    return response;
+                }
+                
                 // 处理Range请求
                 if let Some(range_str) = range_header.and_then(|h| h.to_str().ok()) {
                     if let Some(bytes_range) = range_str.strip_prefix("bytes=") {
                         let ranges: Vec<&str> = bytes_range.split(',').collect();
                         
-                        if ranges.len() == 1 {
-                            // 只处理单一范围的情况
+                        if ranges.len() > 1 {
+                            // 多范围请求，返回适当的响应告知客户端我们仅支持单范围
+                            warn!("请求了多范围 ({}), 但服务器仅支持单范围请求", range_str);
+                            return Response::builder()
+                                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                .header(axum::http::header::CONTENT_RANGE, format!("bytes */{}", content_length))
+                                .body(Body::from("Multiple ranges are not supported"))
+                                .unwrap();
+                        } else if ranges.len() == 1 {
+                            // 处理单一范围的情况
                             let range_parts: Vec<&str> = ranges[0].split('-').collect();
                             
-                            if range_parts.len() == 2 && content_length > 0 {
+                            if range_parts.len() == 2 {
                                 let start_str = range_parts[0];
                                 let end_str = range_parts[1];
                                 
@@ -2018,27 +2068,72 @@ async fn serve_file(
                                     end_str.parse::<u64>().unwrap_or(content_length - 1)
                                 };
                                 
+                                // 检查范围是否有效
+                                if start >= content_length {
+                                    warn!("Range请求范围超出文件大小: 起始位置 {} >= 文件大小 {}", start, content_length);
+                                    return Response::builder()
+                                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                        .header(axum::http::header::CONTENT_RANGE, format!("bytes */{}", content_length))
+                                        .body(Body::from("Range out of bounds"))
+                                        .unwrap();
+                                }
+                                
+                                // 修正end值，确保不超过文件大小
+                                let end = std::cmp::min(end, content_length - 1);
+                                
                                 debug!("处理Range请求: {}-{}/{}", start, end, content_length);
                                 
-                                // 更新响应头和状态码
-                                *response.status_mut() = StatusCode::PARTIAL_CONTENT;
-                                
-                                let range_length = end - start + 1;
-                                
-                                {
-                                    let headers = response.headers_mut();
-                                    if let Ok(content_range) = axum::http::HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, content_length)) {
-                                        headers.insert(axum::http::header::CONTENT_RANGE, content_range);
-                                    }
-                                    
-                                    if let Ok(new_length) = axum::http::HeaderValue::from_str(&range_length.to_string()) {
-                                        headers.insert(axum::http::header::CONTENT_LENGTH, new_length);
+                                // 需要从响应体中提取指定范围的数据
+                                // 首先获取完整的响应体
+                                match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                                    Ok(full_body) => {
+                                        if (start as usize) < full_body.len() {
+                                            // 提取请求的范围
+                                            let end_pos = std::cmp::min(end as usize + 1, full_body.len());
+                                            let partial_body = full_body.slice(start as usize..end_pos);
+                                            
+                                            // 构建新的部分内容响应
+                                            let mut partial_resp = Response::builder()
+                                                .status(StatusCode::PARTIAL_CONTENT)
+                                                .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+                                                .header(axum::http::header::CONTENT_LENGTH, partial_body.len())
+                                                .header(axum::http::header::CONTENT_RANGE, 
+                                                       format!("bytes {}-{}/{}", start, end, content_length))
+                                                .header(axum::http::header::CACHE_CONTROL, "max-age=2592000");
+                                            
+                                            // 添加哈希标头
+                                            if let Ok(header_value) = axum::http::HeaderValue::from_str(&hash) {
+                                                partial_resp = partial_resp.header("x-bmclapi-hash", header_value);
+                                            }
+                                            
+                                            // 返回范围响应
+                                            return partial_resp
+                                                .body(Body::from(partial_body))
+                                                .unwrap();
+                                        } else {
+                                            warn!("Range请求起始位置 {} 超出响应体大小 {}", start, full_body.len());
+                                            return Response::builder()
+                                                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                                                .header(axum::http::header::CONTENT_RANGE, format!("bytes */{}", content_length))
+                                                .body(Body::from("Range out of bounds"))
+                                                .unwrap();
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("读取响应体失败: {}", e);
+                                        return Response::builder()
+                                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                            .body(Body::from(format!("Error reading response body: {}", e)))
+                                            .unwrap();
                                     }
                                 }
                             }
                         }
                     }
                 }
+                
+                // 如果无法处理Range请求，返回原始响应
+                warn!("无法解析Range请求: {:?}", range_header);
             }
             
             // 更新计数器

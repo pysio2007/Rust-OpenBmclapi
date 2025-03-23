@@ -8,3 +8,5 @@ Cargo.lock
 *.log
 openbmclapi
 /openbmclapi
+python-openbmclapi
+/python-openbmclapi

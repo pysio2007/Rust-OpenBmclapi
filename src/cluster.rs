@@ -16,6 +16,7 @@ use rust_socketio::{
     asynchronous::{Client as SocketClient, ClientBuilder},
     Payload, TransportType,
 };
+use tokio::sync::broadcast;
 
 use crate::config::CONFIG;
 use crate::config::{OpenbmclapiAgentConfiguration, SyncConfig};
@@ -24,6 +25,22 @@ use crate::storage::get_storage;
 use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
+
+struct SocketState {
+    cert_receiver: Option<broadcast::Receiver<Vec<Value>>>,
+    enable_receiver: Option<broadcast::Receiver<Vec<Value>>>,
+    disable_receiver: Option<broadcast::Receiver<Vec<Value>>>,
+}
+
+impl Default for SocketState {
+    fn default() -> Self {
+        Self {
+            cert_receiver: None,
+            enable_receiver: None,
+            disable_receiver: None,
+        }
+    }
+}
 
 pub struct Cluster {
     client: Client,
@@ -39,6 +56,8 @@ pub struct Cluster {
     base_url: String,
     tmp_dir: PathBuf,
     cert_key_files: Arc<RwLock<Option<(PathBuf, PathBuf)>>>,
+    socket: Arc<RwLock<Option<SocketClient>>>,
+    socket_state: Arc<RwLock<SocketState>>,
 }
 
 impl Cluster {
@@ -74,6 +93,8 @@ impl Cluster {
             base_url,
             tmp_dir,
             cert_key_files: Arc::new(RwLock::new(None)),
+            socket: Arc::new(RwLock::new(None)),
+            socket_state: Arc::new(RwLock::new(SocketState::default())),
         })
     }
     
@@ -116,60 +137,41 @@ impl Cluster {
     }
     
     pub async fn request_cert(&self) -> Result<()> {
-        info!("正在向服务器请求证书...");
+        // 获取当前的socket连接
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
         
-        // 创建通道，用于接收证书响应
-        let (cert_result_tx, cert_result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
-        let cert_result_tx = Arc::new(tokio::sync::Mutex::new(Some(cert_result_tx)));
+        // 如果没有现有连接，则返回错误
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
         
-        // 创建一个新的Socket.IO客户端，以便注册回调处理证书请求
-        let mut socket_builder = ClientBuilder::new(&self.base_url)
-            .transport_type(TransportType::Websocket);
-        
-        // 注册回调
-        socket_builder = socket_builder.on("request-cert", {
-            let cert_result_tx = cert_result_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let cert_result_tx = cert_result_tx.clone();
-                async move {
-                    info!("收到证书响应");
-                    
-                    // 尝试发送证书数据到通道
-                    match payload {
-                        Payload::Text(values) => {
-                            if let Some(tx) = cert_result_tx.lock().await.take() {
-                                let _ = tx.send(values);
-                            }
-                        },
-                        Payload::Binary(bin_data) => {
-                            error!("收到意外的二进制数据: {:?}", bin_data);
-                        },
-                        _ => {
-                            error!("证书响应格式错误: {:?}", payload);
-                        }
-                    }
-                }.boxed()
+        // 获取证书接收器
+        let mut cert_rx = {
+            let state = self.socket_state.read().unwrap();
+            match &state.cert_receiver {
+                Some(rx) => rx.resubscribe(),
+                None => return Err(anyhow!("没有可用的证书响应接收器，请先调用connect()方法建立连接")),
             }
-        });
-        
-        // 连接并获取客户端
-        let socket = socket_builder.connect().await?;
-        
-        // 认证
-        let token = self.token_manager.get_token().await?;
-        socket.emit("auth", json!({"token": token})).await?;
-        
-        // 等待认证完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        };
         
         // 请求证书
         info!("正在请求证书...");
-        socket.emit("request-cert", json!({})).await?;
+        match socket.emit("request-cert", json!({})).await {
+            Ok(_) => info!("证书请求已发送"),
+            Err(e) => {
+                error!("发送证书请求失败: {}", e);
+                return Err(anyhow!("发送证书请求失败: {}", e));
+            }
+        };
         
         // 等待响应，最多等待10秒
         let cert_array = match tokio::time::timeout(
             Duration::from_secs(10), 
-            cert_result_rx
+            cert_rx.recv()
         ).await {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => return Err(anyhow!("接收证书响应失败: {}", e)),
@@ -212,9 +214,6 @@ impl Cluster {
             let mut cert_files = self.cert_key_files.write().unwrap();
             *cert_files = Some((cert_path, key_path));
         }
-        
-        // 关闭socket连接
-        socket.disconnect().await?;
         
         Ok(())
     }
@@ -429,87 +428,65 @@ impl Cluster {
             *want_enable = true;
         }
         
-        // 获取主机IP
-        let public_ip = match self.host {
-            Some(ref h) => h.clone(),
-            None => {
-                if let Ok(ip) = Self::find_public_ip().await {
-                    ip
-                } else {
-                    return Err(anyhow!("无法获取公网IP"));
-                }
+        info!("启用集群...");
+        
+        // 获取当前的socket连接
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
+        
+        // 如果没有现有连接，则返回错误
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
+        
+        // 获取enable响应接收器
+        let mut enable_rx = {
+            let state = self.socket_state.read().unwrap();
+            match &state.enable_receiver {
+                Some(rx) => rx.resubscribe(),
+                None => return Err(anyhow!("没有可用的enable响应接收器，请先调用connect()方法建立连接")),
             }
         };
         
-        // 在await之前获取CONFIG中需要的值，避免在await点跨越持有锁
-        let byoc = {
-            let config = CONFIG.read().unwrap();
-            config.byoc
+        // 获取IP和端口
+        let public_ip = match Self::find_public_ip().await {
+            Ok(ip) => ip,
+            Err(e) => {
+                error!("无法获取公网IP地址: {}", e);
+                return Err(anyhow!("无法获取公网IP地址: {}", e));
+            }
         };
         
-        let flavor = {
-            let config = CONFIG.read().unwrap();
-            config.flavor.clone()
-        };
+        info!("获取到公网IP地址: {}", public_ip);
         
-        let no_fast_enable = std::env::var("NO_FAST_ENABLE").unwrap_or_else(|_| "false".to_string()) == "true";
-        
-        // 构建请求参数
+        // 准备payload
+        let host = self.host.clone().unwrap_or_else(|| public_ip);
         let payload = json!({
-            "host": public_ip,
+            "host": host,
             "port": self.public_port,
             "version": self.version,
-            "byoc": byoc,
-            "noFastEnable": no_fast_enable,
-            "flavor": flavor,
         });
         
-        // 创建通道来接收应答
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
-        let result_tx = Arc::new(tokio::sync::Mutex::new(Some(result_tx)));
-        
-        // 创建新的Socket.IO客户端并注册回调
-        let mut socket_builder = ClientBuilder::new(&self.base_url)
-            .transport_type(TransportType::Websocket);
-        
-        // 注册回调
-        socket_builder = socket_builder.on("enable", {
-            let result_tx = result_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let result_tx = result_tx.clone();
-                async move {
-                    if let Some(tx) = result_tx.lock().await.take() {
-                        match payload {
-                            Payload::Text(values) => {
-                                let _ = tx.send(values);
-                            },
-                            _ => {
-                                error!("启用集群响应格式错误");
-                            }
-                        }
-                    }
-                }.boxed()
-            }
-        });
-        
-        // 连接并获取客户端
-        let socket = socket_builder.connect().await?;
-        
-        // 认证
-        let token = self.token_manager.get_token().await?;
-        socket.emit("auth", json!({"token": token})).await?;
-        
-        // 等待认证完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        info!("发送的payload: {}", payload);
         
         // 发送enable事件
-        socket.emit("enable", payload).await?;
+        info!("发送启用请求...");
+        match socket.emit("enable", payload).await {
+            Ok(_) => info!("启用请求已发送"),
+            Err(e) => {
+                error!("发送启用请求失败: {}", e);
+                return Err(anyhow!("发送启用请求失败: {}", e));
+            }
+        };
         
         // 等待响应，最多等待5分钟
         let timeout_duration = Duration::from_secs(300); // 5分钟
         let result = match tokio::time::timeout(
             timeout_duration,
-            result_rx
+            enable_rx.recv()
         ).await {
             Ok(Ok(values)) => values,
             Ok(Err(e)) => return Err(anyhow!("接收启用响应失败: {}", e)),
@@ -541,9 +518,6 @@ impl Cluster {
             *is_enabled = true;
         }
         
-        // 断开连接
-        socket.disconnect().await?;
-        
         info!("集群已成功启用");
         Ok(())
     }
@@ -560,51 +534,41 @@ impl Cluster {
             *want_enable = false;
         }
         
-        // 创建通道来接收应答
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Vec<Value>>();
-        let result_tx = Arc::new(tokio::sync::Mutex::new(Some(result_tx)));
+        // 获取当前的socket连接
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
         
-        // 创建新的Socket.IO客户端并注册回调
-        let mut socket_builder = ClientBuilder::new(&self.base_url)
-            .transport_type(TransportType::Websocket);
-            
-        // 注册回调
-        socket_builder = socket_builder.on("disable", {
-            let result_tx = result_tx.clone();
-            move |payload: Payload, _: SocketClient| {
-                let result_tx = result_tx.clone();
-                async move {
-                    if let Some(tx) = result_tx.lock().await.take() {
-                        match payload {
-                            Payload::Text(values) => {
-                                let _ = tx.send(values);
-                            },
-                            _ => {
-                                error!("禁用集群响应格式错误");
-                            }
-                        }
-                    }
-                }.boxed()
+        // 如果没有现有连接，则返回错误
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
+        
+        // 获取disable响应接收器
+        let mut disable_rx = {
+            let state = self.socket_state.read().unwrap();
+            match &state.disable_receiver {
+                Some(rx) => rx.resubscribe(),
+                None => return Err(anyhow!("没有可用的disable响应接收器，请先调用connect()方法建立连接")),
             }
-        });
-        
-        // 连接并获取客户端
-        let socket = socket_builder.connect().await?;
-        
-        // 认证
-        let token = self.token_manager.get_token().await?;
-        socket.emit("auth", json!({"token": token})).await?;
-        
-        // 等待认证完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        };
         
         // 发送disable事件
-        socket.emit("disable", json!(null)).await?;
+        info!("发送禁用请求...");
+        match socket.emit("disable", json!(null)).await {
+            Ok(_) => info!("禁用请求已发送"),
+            Err(e) => {
+                error!("发送禁用请求失败: {}", e);
+                return Err(anyhow!("发送禁用请求失败: {}", e));
+            }
+        };
         
         // 等待响应
         let result = match tokio::time::timeout(
             Duration::from_secs(30),
-            result_rx
+            disable_rx.recv()
         ).await {
             Ok(Ok(values)) => values,
             Ok(Err(e)) => return Err(anyhow!("接收禁用响应失败: {}", e)),
@@ -636,56 +600,359 @@ impl Cluster {
             *is_enabled = false;
         }
         
-        // 断开连接
-        socket.disconnect().await?;
-        
         info!("集群已成功禁用");
         Ok(())
     }
     
     pub async fn send_heartbeat(&self) -> Result<()> {
         if !*self.is_enabled.read().unwrap() {
-            debug!("集群未启用，跳过心跳");
             return Ok(());
         }
         
-        // 获取计数器并克隆，避免长时间持有锁
-        let counters = self.counters.read().unwrap().clone();
+        let host = self.host.clone().unwrap_or_else(|| "".to_string());
         
-        // 构建请求参数
         let payload = json!({
-            "hits": counters.hits,
-            "bytes": counters.bytes,
+            "host": host,
+            "port": self.public_port,
+            "version": self.version,
         });
         
-        // 创建新的Socket.IO客户端
-        let socket = ClientBuilder::new(&self.base_url)
-            .transport_type(TransportType::Websocket)
-            .connect()
-            .await?;
-            
-        // 认证
-        let token = self.token_manager.get_token().await?;
-        socket.emit("auth", json!({"token": token})).await?;
+        // 获取当前的socket连接
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
         
-        // 等待认证完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // 如果没有现有连接，则返回错误
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
         
         // 发送心跳事件
+        debug!("发送心跳...");
         match socket.emit("heartbeat", payload).await {
-            Ok(_) => {
-                debug!("发送心跳成功");
-                // 断开连接
-                let _ = socket.disconnect().await;
+            Ok(_) => debug!("心跳已发送"),
+            Err(e) => {
+                error!("发送心跳失败: {}", e);
+                return Err(anyhow!("发送心跳失败: {}", e));
+            }
+        };
+        
+        Ok(())
+    }
+    
+    // 添加新的connect方法，实现持久Socket.IO连接和重连机制
+    pub async fn connect(&self) -> Result<()> {
+        info!("正在建立Socket.IO持久连接到 {}...", self.base_url);
+        
+        // 获取认证令牌
+        let token = self.token_manager.get_token().await?;
+        
+        // 创建各种事件响应通道
+        let (cert_tx, cert_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
+        let cert_tx = Arc::new(cert_tx);
+        
+        let (enable_tx, enable_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
+        let enable_tx = Arc::new(enable_tx);
+        
+        let (disable_tx, disable_rx) = tokio::sync::broadcast::channel::<Vec<Value>>(32);
+        let disable_tx = Arc::new(disable_tx);
+        
+        // 创建新的Socket.IO客户端
+        let mut socket_builder = ClientBuilder::new(&self.base_url)
+            .transport_type(TransportType::Websocket)
+            .auth(json!({"token": token}));
+        
+        // 注册request-cert事件监听器
+        socket_builder = socket_builder.on("request-cert", {
+            let cert_tx = cert_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let cert_tx = cert_tx.clone();
+                async move {
+                    info!("收到证书响应");
+                    match payload {
+                        Payload::Text(values) => {
+                            if let Err(e) = cert_tx.send(values) {
+                                error!("发送证书响应到通道失败: {}", e);
+                            } else {
+                                debug!("已将证书响应发送到通道");
+                            }
+                        },
+                        _ => error!("收到非文本格式的证书响应: {:?}", payload),
+                    }
+                }.boxed()
+            }
+        });
+        
+        // 注册enable事件监听器
+        socket_builder = socket_builder.on("enable", {
+            let enable_tx = enable_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let enable_tx = enable_tx.clone();
+                async move {
+                    info!("收到enable响应");
+                    match payload {
+                        Payload::Text(values) => {
+                            if let Err(e) = enable_tx.send(values) {
+                                error!("发送enable响应到通道失败: {}", e);
+                            } else {
+                                debug!("已将enable响应发送到通道");
+                            }
+                        },
+                        _ => error!("收到非文本格式的enable响应: {:?}", payload),
+                    }
+                }.boxed()
+            }
+        });
+        
+        // 注册disable事件监听器
+        socket_builder = socket_builder.on("disable", {
+            let disable_tx = disable_tx.clone();
+            move |payload: Payload, _: SocketClient| {
+                let disable_tx = disable_tx.clone();
+                async move {
+                    info!("收到disable响应");
+                    match payload {
+                        Payload::Text(values) => {
+                            if let Err(e) = disable_tx.send(values) {
+                                error!("发送disable响应到通道失败: {}", e);
+                            } else {
+                                debug!("已将disable响应发送到通道");
+                            }
+                        },
+                        _ => error!("收到非文本格式的disable响应: {:?}", payload),
+                    }
+                }.boxed()
+            }
+        });
+        
+        // 连接事件
+        socket_builder = socket_builder.on("connect", {
+            let cluster = self.clone();
+            move |_: Payload, _: SocketClient| {
+                let cluster = cluster.clone();
+                async move {
+                    info!("Socket.IO连接已建立 - 收到connect事件");
+                    
+                    // 记录当前状态
+                    let is_enabled = *cluster.is_enabled.read().unwrap();
+                    let want_enable = *cluster.want_enable.read().unwrap();
+                    info!("当前集群状态 - 是否启用: {}, 是否希望启用: {}", is_enabled, want_enable);
+                    
+                    // 如果之前已启用但因连接断开而停用，则自动重新启用
+                    if *cluster.want_enable.read().unwrap() && !*cluster.is_enabled.read().unwrap() {
+                        info!("检测到连接重新建立，且want_enable=true但is_enabled=false，将尝试重新启用集群");
+                        let cluster_clone = cluster.clone();
+                        tokio::spawn(async move {
+                            info!("开始尝试重新启用集群...");
+                            if let Err(e) = cluster_clone.enable().await {
+                                error!("自动重新启用集群失败: {}, 错误详情: {:?}", e, e);
+                            } else {
+                                info!("集群已成功重新启用");
+                            }
+                        });
+                    } else if *cluster.want_enable.read().unwrap() && *cluster.is_enabled.read().unwrap() {
+                        info!("集群当前状态正常 (want_enable=true, is_enabled=true)，无需执行额外操作");
+                    } else if !*cluster.want_enable.read().unwrap() {
+                        info!("集群当前不希望启用 (want_enable=false)，不会尝试重新启用");
+                    }
+                }.boxed()
+            }
+        });
+        
+        // 打印连接配置信息
+        info!("Socket.IO配置: URL={}, 传输类型=Websocket", self.base_url);
+        
+        // 尝试连接
+        match socket_builder.connect().await {
+            Ok(socket) => {
+                info!("Socket.IO连接已建立，准备认证");
+                
+                // 等待连接稳定
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                
+                // 保存到共享变量
+                {
+                    let mut socket_guard = self.socket.write().unwrap();
+                    *socket_guard = Some(socket.clone());
+                    info!("已将新的Socket.IO连接保存到共享状态");
+                }
+                
+                // 保存各种响应接收器
+                {
+                    let mut state = self.socket_state.write().unwrap();
+                    state.cert_receiver = Some(cert_rx);
+                    state.enable_receiver = Some(enable_rx);
+                    state.disable_receiver = Some(disable_rx);
+                    debug!("已保存所有事件响应接收器");
+                }
+                
+                // 记录基本连接信息
+                info!("Socket.IO连接已完成初始化并保存");
+                
+                // 启动keep-alive定时任务
+                let cluster = self.clone();
+                tokio::spawn(async move {
+                    cluster.start_keepalive_task().await;
+                });
+                
                 Ok(())
             },
             Err(e) => {
-                error!("发送心跳失败: {}", e);
-                // 断开连接
-                let _ = socket.disconnect().await;
-                Err(anyhow!("发送心跳失败: {}", e))
+                error!("Socket.IO连接失败: {}，错误详情: {:?}", e, e);
+                
+                // 根据错误消息提供更多具体信息
+                let err_str = e.to_string();
+                if err_str.contains("timeout") {
+                    error!("连接超时 - 请检查网络连接和服务器状态");
+                } else if err_str.contains("connection") || err_str.contains("connect") {
+                    error!("连接错误 - 可能是网络问题或服务器不可用");
+                } else if err_str.contains("handshake") {
+                    error!("握手错误 - 认证可能失败或服务器不接受连接");
+                } else if err_str.contains("auth") {
+                    error!("认证错误 - 请检查令牌是否有效");
+                }
+                
+                // 尝试重新连接
+                info!("将在5秒后尝试重新连接");
+                
+                // 创建一个不依赖于self的重连逻辑
+                let base_url = self.base_url.clone();
+                let token_manager = self.token_manager.clone();
+                let want_enable = Arc::clone(&self.want_enable);
+                let _is_enabled = Arc::clone(&self.is_enabled);
+                
+                // 不再使用rx/tx通道，直接在tokio::spawn中尝试重连
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    
+                    // 先检查是否还想要启用
+                    if !*want_enable.read().unwrap() {
+                        debug!("集群已不再需要连接，取消重连");
+                        return;
+                    }
+                    
+                    // 获取令牌
+                    let token = match token_manager.get_token().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!("获取令牌失败，无法重连: {}", e);
+                            return;
+                        }
+                    };
+                    
+                    // 尝试重连
+                    info!("正在尝试Socket.IO重新连接到 {}...", base_url);
+                    match ClientBuilder::new(&base_url)
+                        .transport_type(TransportType::Websocket)
+                        .auth(json!({"token": token}))
+                        .connect().await 
+                    {
+                        Ok(_socket) => {
+                            info!("Socket.IO重连成功，连接已建立");
+                            // 后续处理将由connect事件监听器完成
+                        },
+                        Err(e) => error!("Socket.IO重新连接失败: {}，错误详情: {:?}", e, e)
+                    }
+                });
+                
+                Err(anyhow!("Socket.IO连接失败: {}", e))
             }
         }
+    }
+    
+    // 添加新的定时发送keep-alive的方法
+    async fn start_keepalive_task(&self) {
+        info!("启动keep-alive定时任务 (间隔60秒)");
+        let mut failed_keepalive = 0;
+        
+        while *self.is_enabled.read().unwrap() {
+            // 等待60秒
+            debug!("等待60秒后发送下一次keep-alive...");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            debug!("keep-alive计时结束，准备发送keep-alive");
+            
+            if !*self.is_enabled.read().unwrap() {
+                info!("集群已禁用 (is_enabled=false)，停止keep-alive定时任务");
+                break;
+            }
+            
+            // 获取当前计数器数据
+            let current_counter = {
+                let counters = self.counters.read().unwrap();
+                counters.clone()
+            };
+            
+            // 准备发送的数据
+            let start_time = chrono::Utc::now().timestamp() * 1000;
+            let payload = json!({
+                "hits": current_counter.hits,
+                "bytes": current_counter.bytes,
+                "time": start_time
+            });
+            
+            // 获取socket
+            let socket_opt = {
+                let socket_guard = self.socket.read().unwrap();
+                socket_guard.clone()
+            };
+            
+            if let Some(socket) = socket_opt {
+                debug!("发送keep-alive数据: {:?} (当前时间戳: {})", payload, start_time);
+                
+                match socket.emit("keep-alive", payload).await {
+                    Ok(_) => {
+                        // 发送成功，重置失败计数
+                        if failed_keepalive > 0 {
+                            info!("keep-alive发送成功，重置失败计数 (之前失败次数: {})", failed_keepalive);
+                        } else {
+                            debug!("keep-alive发送成功");
+                        }
+                        failed_keepalive = 0;
+                        
+                        // 更新计数器，减去已报告的值
+                        {
+                            let mut counters = self.counters.write().unwrap();
+                            counters.hits -= current_counter.hits;
+                            counters.bytes -= current_counter.bytes;
+                            debug!("更新计数器 - 当前计数 hits: {}, bytes: {}", 
+                                  counters.hits, counters.bytes);
+                        }
+                        
+                        debug!("keep-alive处理完成，等待下一个周期");
+                    },
+                    Err(e) => {
+                        failed_keepalive += 1;
+                        error!("发送keep-alive失败 ({}/3): {}, 错误详情: {:?}", 
+                              failed_keepalive, e, e);
+                        
+                        if failed_keepalive >= 3 {
+                            error!("连续3次keep-alive失败，将禁用集群 (当前连接可能已断开)");
+                            // 在一个新的任务中禁用集群，避免死锁
+                            let _cluster_id = self.token_manager.clone();
+                            let want_enable = Arc::clone(&self.want_enable);
+                            
+                            tokio::spawn(async move {
+                                // 设置状态为不希望启用
+                                {
+                                    let mut want_enable_guard = want_enable.write().unwrap();
+                                    let previous = *want_enable_guard;
+                                    *want_enable_guard = false;
+                                    info!("由于连续keep-alive失败，已设置集群为不希望启用状态 (之前状态: {})", previous);
+                                }
+                            });
+                            break;
+                        }
+                    }
+                }
+            } else {
+                error!("没有可用的Socket.IO连接，无法发送keep-alive (socket为None)");
+                break;
+            }
+        }
+        
+        info!("keep-alive定时任务结束");
     }
     
     pub async fn get_file_list(&self, last_modified: Option<u64>) -> Result<FileList> {
@@ -890,32 +1157,36 @@ impl Cluster {
             "flavor": flavor,
         });
 
-        // 创建新的Socket.IO客户端
-        let socket = ClientBuilder::new(&self.base_url)
-            .transport_type(TransportType::Websocket)
-            .connect()
-            .await?;
-            
-        // 认证
-        let token = self.token_manager.get_token().await?;
-        socket.emit("auth", json!({"token": token})).await?;
+        // 获取当前的socket连接
+        let socket_opt = {
+            let socket_guard = self.socket.read().unwrap();
+            socket_guard.clone()
+        };
         
-        // 等待认证完成
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // 如果没有现有连接，则返回错误
+        let socket = match socket_opt {
+            Some(socket) => socket,
+            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+        };
         
         // 发送port-check事件
-        socket.emit("port-check", payload).await?;
+        info!("发送端口检查请求...");
+        match socket.emit("port-check", payload).await {
+            Ok(_) => info!("端口检查请求已发送"),
+            Err(e) => {
+                error!("发送端口检查请求失败: {}", e);
+                return Err(anyhow!("发送端口检查请求失败: {}", e));
+            }
+        };
         
         // 等待一段时间确保事件被服务器处理
         tokio::time::sleep(Duration::from_secs(2)).await;
         
-        // 断开连接
-        socket.disconnect().await?;
-        
         Ok(())
     }
 
-    // 寻找公网IP的辅助函数
+    // 查找公网IP（未使用）
+    #[allow(dead_code)]
     async fn find_public_ip() -> Result<String> {
         // 首先检查是否启用UPnP及获取端口配置
         let enable_upnp = {
@@ -1002,6 +1273,8 @@ impl Clone for Cluster {
             base_url: self.base_url.clone(),
             tmp_dir: self.tmp_dir.clone(),
             cert_key_files: self.cert_key_files.clone(),
+            socket: self.socket.clone(),
+            socket_state: self.socket_state.clone(),
         }
     }
 }
@@ -1183,4 +1456,29 @@ async fn auth_handler(req: Request<Body>) -> impl IntoResponse {
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .unwrap()
+}
+
+// 尝试重新连接集群（未使用）
+#[allow(dead_code)]
+async fn try_reconnect(cluster: &Cluster) -> Result<(), anyhow::Error> {
+    // 如果集群已经不想启用，则直接返回
+    if !*cluster.want_enable.read().unwrap() {
+        return Ok(());
+    }
+    
+    info!("尝试重新连接服务器...");
+    
+    // 直接调用connect方法
+    match cluster.connect().await {
+        Ok(_) => {
+            info!("集群连接已恢复");
+            
+            // 如果之前希望启用但现在处于禁用状态，connect中的connect事件处理器会自动处理重新启用
+            Ok(())
+        },
+        Err(e) => {
+            error!("重新连接失败: {}", e);
+            Err(anyhow!("重新连接失败: {}", e))
+        }
+    }
 } 

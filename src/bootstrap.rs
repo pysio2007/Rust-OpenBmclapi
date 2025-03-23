@@ -41,6 +41,10 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     keepalive.set_cluster(Arc::new(cluster.clone())).await;
     keepalive.start().await;
     
+    // 添加：建立持久Socket.IO连接
+    info!("建立Socket.IO持久连接...");
+    cluster.connect().await?;
+    
     // 设置HTTPS
     let _use_https = true; // 默认使用HTTPS
     let mut proto = "https";

@@ -438,28 +438,64 @@ impl Cluster {
         Router::new()
             .layer(axum::middleware::from_fn(|req: Request, next: middleware::Next| {
                 async move {
+                    // 保存所有请求信息，避免后续借用冲突
                     let method = req.method().clone();
-                    let version = format!("{:?}", req.version());
+                    let version = match req.version() {
+                        axum::http::Version::HTTP_09 => "HTTP/0.9",
+                        axum::http::Version::HTTP_10 => "HTTP/1.0",
+                        axum::http::Version::HTTP_11 => "HTTP/1.1",
+                        axum::http::Version::HTTP_2 => "HTTP/2.0",
+                        axum::http::Version::HTTP_3 => "HTTP/3.0",
+                        _ => "HTTP/?",
+                    };
                     let uri = req.uri().clone();
+                    let path = uri.path().to_string();
+                    let query = uri.query().map(|q| q.to_string());
+                    
                     let remote_addr = req.extensions()
                         .get::<ConnectInfo<std::net::SocketAddr>>()
                         .map(|connect_info| connect_info.0)
                         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                    
+                    // 获取IP地址
+                    let ip_str = match remote_addr.ip() {
+                        std::net::IpAddr::V4(ipv4) => format!("{}", ipv4),
+                        std::net::IpAddr::V6(ipv6) => format!("::ffff:{}", ipv6),
+                    };
+                    
                     let user_agent = req.headers()
                         .get(axum::http::header::USER_AGENT)
                         .and_then(|h| h.to_str().ok())
-                        .unwrap_or("未知UA");
+                        .unwrap_or("-")
+                        .to_string();
                     
-                    let display_addr = if remote_addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) && remote_addr.port() == 0 {
-                        "未知IP".to_string()
+                    // 获取当前时间
+                    let now = chrono::Local::now();
+                    let time_str = now.format("%d/%b/%Y:%H:%M:%S %z").to_string();
+                    
+                    // 获取URI路径和查询参数
+                    let request_line = if let Some(q) = &query {
+                        format!("{} {}?{} {}", method, path, q, version)
                     } else {
-                        remote_addr.to_string()
+                        format!("{} {} {}", method, path, version)
                     };
                     
-                    info!("收到请求 - IP: {}, 方法: {}, URL: {}, UA: {}, HTTP版本: {}", 
-                        display_addr, method, uri, user_agent, version);
+                    // 执行请求处理，首先克隆请求
+                    let response = next.run(req).await;
                     
-                    next.run(req).await
+                    // 获取响应状态码和内容长度
+                    let status = response.status().as_u16();
+                    let content_length = response.headers()
+                        .get(axum::http::header::CONTENT_LENGTH)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    
+                    // 使用Apache风格记录完整日志
+                    info!("{} - - [{}] \"{}\" {} {} \"-\" \"{}\"", 
+                        ip_str, time_str, request_line, status, content_length, user_agent);
+                    
+                    response
                 }
             }))
             .route("/download/:hash", get(serve_file))
@@ -1815,7 +1851,7 @@ impl std::fmt::Debug for Cluster {
 async fn serve_file(
     State(cluster): State<Arc<Cluster>>,
     Path(hash): Path<String>,
-    req: Request<axum::body::Body>,
+    req: Request,
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
@@ -1825,21 +1861,21 @@ async fn serve_file(
         .map(|connect_info| connect_info.0)
         .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
     
-    let display_addr = if remote_addr.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)) && remote_addr.port() == 0 {
-        "未知IP".to_string()
-    } else {
-        remote_addr.to_string()
+    // 修复IP显示为"未知"的问题，直接使用远程IP地址
+    let ip_str = match remote_addr.ip() {
+        std::net::IpAddr::V4(ipv4) => format!("{}", ipv4),
+        std::net::IpAddr::V6(ipv6) => format!("::ffff:{}", ipv6),
     };
     
     let user_agent = req.headers()
         .get(axum::http::header::USER_AGENT)
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("未知UA");
-    
-    info!("文件下载请求 - IP: {}, 文件: {}, UA: {}", display_addr, hash, user_agent);
+        .unwrap_or("-");
     
     // 处理查询参数，用于签名验证 - 使用url类库更可靠地解析
     let mut query_params = HashMap::new();
+    let query_str = req.uri().query().unwrap_or("");
+    
     if let Some(query) = req.uri().query() {
         let query_str = format!("http://localhost/?{}", query);
         if let Ok(url) = Url::parse(&query_str) {
@@ -1848,6 +1884,29 @@ async fn serve_file(
             }
         }
     }
+    
+    // 获取当前时间
+    let now = chrono::Local::now();
+    let time_str = now.format("%d/%b/%Y:%H:%M:%S %z").to_string();
+    
+    // 获取请求方法和HTTP版本
+    let method = req.method().to_string();
+    let version = format!("HTTP/{}", match req.version() {
+        axum::http::Version::HTTP_09 => "0.9",
+        axum::http::Version::HTTP_10 => "1.0",
+        axum::http::Version::HTTP_11 => "1.1",
+        axum::http::Version::HTTP_2 => "2.0",
+        axum::http::Version::HTTP_3 => "3.0",
+        _ => "?",
+    });
+    
+    // 获取URL路径和查询字符串
+    let path = req.uri().path();
+    let full_url = if !query_str.is_empty() {
+        format!("{}?{}", path, query_str)
+    } else {
+        path.to_string()
+    };
     
     // 验证签名
     let cluster_secret = {
@@ -1860,7 +1919,10 @@ async fn serve_file(
     // 修改：直接使用hash作为path参数，而不是/download/hash前缀
     let sign_valid = crate::util::check_sign(&hash, &cluster_secret, &query_params);
     if !sign_valid {
-        error!("签名验证失败 - IP: {}, 文件: {}, 参数: {:?}", display_addr, hash, query_params);
+        // 使用Apache风格日志记录签名验证失败
+        error!("{} - - [{}] \"{} {} {}\" 403 0 \"-\" \"{}\"", 
+               ip_str, time_str, method, full_url, version, user_agent);
+        
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(Body::from("Invalid signature"))
@@ -1875,6 +1937,10 @@ async fn serve_file(
         Ok(exists) => exists,
         Err(e) => {
             error!("检查文件存在性失败: {}", e);
+            // 使用Apache风格日志记录内部错误
+            error!("{} - - [{}] \"{} {} {}\" 500 0 \"-\" \"{}\"", 
+                   ip_str, time_str, method, full_url, version, user_agent);
+                   
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(format!("检查文件失败: {}", e)))
@@ -1883,7 +1949,10 @@ async fn serve_file(
     };
     
     if !exists {
-        error!("请求的文件不存在: {}", file_path);
+        // 使用Apache风格日志记录文件不存在
+        error!("{} - - [{}] \"{} {} {}\" 404 0 \"-\" \"{}\"", 
+               ip_str, time_str, method, full_url, version, user_agent);
+               
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("File not found"))
@@ -1909,6 +1978,18 @@ async fn serve_file(
                     headers.insert("x-bmclapi-hash", header_value);
                 }
             }
+            
+            // 获取响应的内容长度
+            let content_length = response.headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            
+            // 使用Apache风格日志记录成功的请求
+            info!("{} - - [{}] \"{} {} {}\" {} {} \"-\" \"{}\"", 
+                  ip_str, time_str, method, full_url, version, 
+                  response.status().as_u16(), content_length, user_agent);
             
             // 如果有Range请求头但Storage没有处理，我们需要在这里处理
             if range_header.is_some() && response.status() != StatusCode::PARTIAL_CONTENT {
@@ -2040,6 +2121,10 @@ async fn serve_file(
         },
         Err(e) => {
             error!("处理文件请求失败: {}", e);
+            // 使用Apache风格日志记录处理失败
+            error!("{} - - [{}] \"{} {} {}\" 500 0 \"-\" \"{}\"", 
+                   ip_str, time_str, method, full_url, version, user_agent);
+                   
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::from(format!("处理请求失败: {}", e)))
@@ -2062,7 +2147,7 @@ pub fn hash_to_filename(hash: &str) -> String {
 
 // 从openapi.rs移植过来的auth处理程序
 async fn auth_handler(
-    req: Request<axum::body::Body>,
+    req: Request,
 ) -> impl IntoResponse {
     let config = CONFIG.read().unwrap();
     

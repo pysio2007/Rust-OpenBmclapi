@@ -9,11 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::fs;
 use log;
+use md5;
 
 // 将哈希值转换为文件名
 pub fn hash_to_filename(hash: &str) -> String {
-    let prefix = &hash[0..2];
-    Path::new(prefix).join(hash).to_string_lossy().to_string()
+    // 始终使用 / 作为分隔符，避免平台差异
+    format!("{}/{}", &hash[0..2], hash)
 }
 
 // 计算文件的SHA1哈希值
@@ -126,4 +127,34 @@ pub fn check_sign(path: &str, secret: &str, query: &HashMap<String, String>) -> 
            sign_match, not_expired, now, expire_time);
     
     sign_match && not_expired
+}
+
+// 修改validate_file函数，添加忽略大小写和跨平台路径处理，并支持SHA1和MD5两种哈希算法
+pub fn validate_file(data: &[u8], hash: &str) -> bool {
+    let expected = hash.to_lowercase().trim().to_string();
+    
+    // 根据哈希长度判断使用哪种算法
+    if expected.len() == 32 {
+        // MD5哈希 (32位)
+        let digest = md5::compute(data);
+        let actual = format!("{:x}", digest).to_lowercase();
+        
+        if expected != actual {
+            log::debug!("MD5哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+        }
+        
+        actual == expected
+    } else {
+        // SHA1哈希 (40位)
+        use sha1::{Sha1, Digest};
+        let mut hasher = Sha1::new();
+        hasher.update(data);
+        let actual = format!("{:x}", hasher.finalize()).to_lowercase();
+        
+        if expected != actual {
+            log::debug!("SHA1哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+        }
+        
+        actual == expected
+    }
 } 

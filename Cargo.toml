@@ -59,3 +59,4 @@ rustls-pki-types = "1.0"
 async-stream = "0.3"
 # AVRO格式解析
 apache-avro = "0.16"
+md5 = "0.7.0"

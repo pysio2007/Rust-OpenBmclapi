@@ -2151,12 +2151,32 @@ async fn serve_file(
 }
 
 pub fn validate_file(data: &[u8], hash: &str) -> bool {
-    // 在下载文件时仍然需要验证内容的SHA1哈希与文件名（hash）相符
-    use sha1::{Sha1, Digest};
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    let calculated_hash = format!("{:x}", hasher.finalize());
-    calculated_hash == hash.to_lowercase()
+    let expected = hash.to_lowercase().trim().to_string();
+    
+    // 根据哈希长度判断使用哪种算法
+    if expected.len() == 32 {
+        // MD5哈希 (32位)
+        let digest = md5::compute(data);
+        let actual = format!("{:x}", digest).to_lowercase();
+        
+        if expected != actual {
+            log::debug!("MD5哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+        }
+        
+        actual == expected
+    } else {
+        // SHA1哈希 (40位)
+        use sha1::{Sha1, Digest};
+        let mut hasher = Sha1::new();
+        hasher.update(data);
+        let actual = format!("{:x}", hasher.finalize()).to_lowercase();
+        
+        if expected != actual {
+            log::debug!("SHA1哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+        }
+        
+        actual == expected
+    }
 }
 
 pub fn hash_to_filename(hash: &str) -> String {

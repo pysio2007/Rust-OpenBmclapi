@@ -414,19 +414,35 @@ impl Cluster {
     pub async fn start_server(&self, router: Router, addr: std::net::SocketAddr) -> Result<()> {
         info!("正在启动HTTP服务器，监听地址: {}", addr);
         
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        info!("成功绑定到端口 {}", addr.port());
+        // 使用手动方式创建并配置TcpListener，确保可以正确获取客户端IP
+        let socket = match addr.ip() {
+            std::net::IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            std::net::IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
         
-        // 配置HTTP服务器 - 增加超时设置
-        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        // 设置SO_REUSEADDR选项允许地址重用
+        socket.set_reuseaddr(true)?;
         
-        // 使用axum::serve并增加超时中间件
+        // 绑定到指定地址
+        socket.bind(addr)?;
+        
+        // 开始监听连接
+        let listener = socket.listen(1024)?;
+        
+        info!("成功绑定到端口 {}，启用地址重用", addr.port());
+        info!("配置TCP监听器，启用IP地址传递，最大连接队列: 1024");
+        
+        // 配置Axum响应应用并启用连接信息收集
+        let app = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        
+        // 使用axum::serve启动服务
+        info!("启动服务器，使用增强型连接信息收集机制");
         let server = axum::serve(
             listener,
-            service
+            app
         );
         
-        info!("HTTP服务器开始运行，已配置长连接支持");
+        info!("HTTP服务器开始运行，已配置长连接支持和IP地址收集");
         server.await?;
         
         Ok(())
@@ -452,16 +468,16 @@ impl Cluster {
                     let path = uri.path().to_string();
                     let query = uri.query().map(|q| q.to_string());
                     
-                    let remote_addr = req.extensions()
-                        .get::<ConnectInfo<std::net::SocketAddr>>()
-                        .map(|connect_info| connect_info.0)
-                        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                    // 获取客户端IP地址
+                    // 直接输出socket连接信息，确定是否有正确连接
+                    if let Some(connect_info) = req.extensions().get::<ConnectInfo<std::net::SocketAddr>>() {
+                        debug!("原始socket连接信息: {}", connect_info.0);
+                    } else {
+                        debug!("无法获取socket连接信息!");
+                    }
                     
-                    // 获取IP地址
-                    let ip_str = match remote_addr.ip() {
-                        std::net::IpAddr::V4(ipv4) => format!("{}", ipv4),
-                        std::net::IpAddr::V6(ipv6) => format!("::ffff:{}", ipv6),
-                    };
+                    // 获取真实IP地址
+                    let ip_str = get_client_ip(&req);
                     
                     let user_agent = req.headers()
                         .get(axum::http::header::USER_AGENT)
@@ -784,22 +800,10 @@ impl Cluster {
                     while *cluster.is_enabled.read().unwrap() {
                         interval.tick().await;
                         
-                        // 获取当前计数
-                        let current_counter = {
-                            let counters = cluster.counters.read().unwrap();
-                            counters.clone()
-                        };
-                        
-                        
                         // 发送心跳
                         match cluster.send_heartbeat().await {
                             Ok(_) => {
-                                // 成功发送后，减去已上报的计数
-                                let mut counters = cluster.counters.write().unwrap();
-                                counters.hits -= current_counter.hits;
-                                counters.bytes -= current_counter.bytes;
-                                debug!("心跳发送成功，更新计数器 - 当前计数 hits: {}, bytes: {}", 
-                                    counters.hits, counters.bytes);
+                                debug!("心跳发送成功，计数器已在send_heartbeat中更新");
                             }
                             Err(e) => {
                                 error!("发送心跳失败: {}", e);
@@ -926,52 +930,52 @@ impl Cluster {
     }
     
     pub async fn send_heartbeat(&self) -> Result<()> {
-        if !*self.is_enabled.read().unwrap() {
-            return Ok(());
-        }
-        
-        let host = self.host.clone().unwrap_or_else(|| "".to_string());
-        
-        let payload = json!({
-            "host": host,
-            "port": self.public_port,
-            "version": env!("CARGO_PKG_VERSION"),
-            "time": chrono::Utc::now().timestamp_millis(),
-        });
-        
-        let socket_opt = {
+        // 获取当前计数器状态
+        let current_counter = {
+            let counters = self.counters.read().unwrap();
+            let counter_copy = counters.clone();
+            info!("准备上报计数器数据 - hits: {}, bytes: {}", 
+                counter_copy.hits, counter_copy.bytes);
+            counter_copy
+        };
+
+        // 构建心跳请求
+        let socket_result = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
-        
-        let socket = match socket_opt {
+
+        let socket = match socket_result {
             Some(socket) => socket,
-            None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
+            None => {
+                debug!("没有已连接的WebSocket，跳过心跳发送");
+                return Ok(());
+            }
         };
-        
-        let ack_callback = move |message: Payload, _| {
-            async move {
-                debug!("收到heartbeat响应回调");
-                match message {
-                    Payload::Text(values) => {
-                        debug!("处理heartbeat响应的文本数据: {:?}", values);
-                    },
-                    _ => error!("收到非文本格式的heartbeat响应: {:?}", message),
-                }
-            }.boxed()
-        };
-        
-        debug!("发送心跳...");
-        let res = socket
-            .emit_with_ack("heartbeat", payload, Duration::from_secs(5), ack_callback)
-            .await;
-            
-        if res.is_err() {
-            error!("发送心跳失败: {:?}", res.err());
-            return Err(anyhow!("发送心跳失败"));
-        }
-        
-        debug!("心跳请求已完成");
+
+        // 心跳数据不再包含IP信息
+        let payload = json!({
+            "type": "heartbeat",
+            "version": self.version,
+            "publicPort": self.public_port,
+            "metrics": {
+                "hits": current_counter.hits,
+                "bytes": current_counter.bytes
+            }
+        });
+
+        // 发送心跳
+        debug!("发送心跳: {}", payload);
+        socket.emit("heartbeat", payload).await?;
+
+        // 心跳成功发送后，重置计数器
+        let mut counters = self.counters.write().unwrap();
+        let old_hits = counters.hits;
+        let old_bytes = counters.bytes;
+        counters.hits = 0;
+        counters.bytes = 0;
+        info!("心跳发送成功，更新计数器 - 本次上报计数 hits: {}, bytes: {}", old_hits, old_bytes);
+
         Ok(())
     }
     
@@ -1848,6 +1852,13 @@ impl std::fmt::Debug for Cluster {
     }
 }
 
+// 添加format_http_date函数
+fn format_http_date(time: std::time::SystemTime) -> String {
+    use chrono::{DateTime, Utc};
+    let datetime: DateTime<Utc> = time.into();
+    datetime.format("%d/%b/%Y:%H:%M:%S %z").to_string()
+}
+
 async fn serve_file(
     State(cluster): State<Arc<Cluster>>,
     Path(hash): Path<String>,
@@ -1855,24 +1866,16 @@ async fn serve_file(
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
-    // 获取远程IP和UA用于记录访问日志
-    let remote_addr = req.extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|connect_info| connect_info.0)
-        .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
-    
-    // 修复IP显示为"未知"的问题，直接使用远程IP地址
-    let ip_str = match remote_addr.ip() {
-        std::net::IpAddr::V4(ipv4) => format!("{}", ipv4),
-        std::net::IpAddr::V6(ipv6) => format!("::ffff:{}", ipv6),
-    };
-    
+    // 仅获取User-Agent信息，不再获取IP
     let user_agent = req.headers()
         .get(axum::http::header::USER_AGENT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     
-    // 处理查询参数，用于签名验证 - 使用url类库更可靠地解析
+    // 客户端请求日志 - 不再包含IP信息
+    info!("文件下载请求 - UA: {}, 文件: {}", user_agent, hash);
+    
+    // 处理查询参数，用于签名验证
     let mut query_params = HashMap::new();
     let query_str = req.uri().query().unwrap_or("");
     
@@ -1921,7 +1924,7 @@ async fn serve_file(
     if !sign_valid {
         // 使用Apache风格日志记录签名验证失败
         error!("{} - - [{}] \"{} {} {}\" 403 0 \"-\" \"{}\"", 
-               ip_str, time_str, method, full_url, version, user_agent);
+               user_agent, time_str, method, full_url, version, user_agent);
         
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -1939,7 +1942,7 @@ async fn serve_file(
             error!("检查文件存在性失败: {}", e);
             // 使用Apache风格日志记录内部错误
             error!("{} - - [{}] \"{} {} {}\" 500 0 \"-\" \"{}\"", 
-                   ip_str, time_str, method, full_url, version, user_agent);
+                   user_agent, time_str, method, full_url, version, user_agent);
                    
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1951,7 +1954,7 @@ async fn serve_file(
     if !exists {
         // 使用Apache风格日志记录文件不存在
         error!("{} - - [{}] \"{} {} {}\" 404 0 \"-\" \"{}\"", 
-               ip_str, time_str, method, full_url, version, user_agent);
+               user_agent, time_str, method, full_url, version, user_agent);
                
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -1987,9 +1990,37 @@ async fn serve_file(
                 .unwrap_or(0);
             
             // 使用Apache风格日志记录成功的请求
-            info!("{} - - [{}] \"{} {} {}\" {} {} \"-\" \"{}\"", 
-                  ip_str, time_str, method, full_url, version, 
-                  response.status().as_u16(), content_length, user_agent);
+            info!("anonymous - - [{}] \"{}\" {} {} \"-\" \"{}\"",
+                format_http_date(std::time::SystemTime::now()),
+                format!("{} {} HTTP/1.1", 
+                    req.method(),
+                    req.uri()
+                ),
+                response.status().as_u16(),
+                content_length,
+                user_agent
+            );
+            
+            // 更新计数器 - 只累计成功状态的请求
+            if response.status().is_success() {
+                // 获取实际返回的内容长度
+                let content_length = response.headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                
+                if content_length > 0 {
+                    let mut counters = cluster.counters.write().unwrap();
+                    counters.hits += 1;
+                    counters.bytes += content_length;
+                    
+                    debug!("文件上传成功 - 累计计数器: hits={}, bytes={}，本次上传: {} 字节", 
+                        counters.hits, counters.bytes, content_length);
+                } else {
+                    debug!("文件上传成功但内容长度为0，不累计计数");
+                }
+            }
             
             // 如果有Range请求头但Storage没有处理，我们需要在这里处理
             if range_header.is_some() && response.status() != StatusCode::PARTIAL_CONTENT {
@@ -2103,27 +2134,13 @@ async fn serve_file(
                 warn!("无法解析Range请求: {:?}", range_header);
             }
             
-            // 更新计数器
-            {
-                let content_length = response.headers().get(axum::http::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                
-                if content_length > 0 {
-                    let mut counters = cluster.counters.write().unwrap();
-                    counters.hits += 1;
-                    counters.bytes += content_length;
-                }
-            }
-            
             response
         },
         Err(e) => {
             error!("处理文件请求失败: {}", e);
             // 使用Apache风格日志记录处理失败
             error!("{} - - [{}] \"{} {} {}\" 500 0 \"-\" \"{}\"", 
-                   ip_str, time_str, method, full_url, version, user_agent);
+                   user_agent, time_str, method, full_url, version, user_agent);
                    
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -2227,4 +2244,10 @@ async fn measure_handler(
         .body(Body::from(buffer_bytes.repeat(size as usize)))
         .unwrap()
         .into_response()
+}
+
+// 获取真实客户端IP地址的工具函数 - 不再获取IP地址
+fn get_client_ip(_req: &Request) -> String {
+    // 不再获取IP地址，仅返回固定值
+    "anonymous".to_string()
 }

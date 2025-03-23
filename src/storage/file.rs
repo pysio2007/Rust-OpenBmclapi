@@ -8,11 +8,12 @@ use tokio::fs;
 use tokio_util::io::ReaderStream;
 use colored::Colorize;
 use tokio::time::{sleep, Duration};
-use sha2::{Sha256, Digest};
+use sha1::{Sha1, Digest};
 
-use log::{info, warn, error};
+use log::{info, warn, error, debug};
 use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
+use crate::util::hash_to_filename;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: u64 = 5;
@@ -37,11 +38,11 @@ impl FileStorage {
             }
         };
         
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha1::new();
         hasher.update(&content);
         let actual_hash = format!("{:x}", hasher.finalize());
         
-        Ok(actual_hash == expected_hash)
+        Ok(actual_hash.to_lowercase() == expected_hash.to_lowercase())
     }
     
     async fn retry_operation<F, Fut, T>(&self, operation: F, description: &str) -> Result<T>
@@ -134,10 +135,35 @@ impl Storage for FileStorage {
         let mut missing_files = Vec::new();
         
         for file in files {
-            let hash_path = self.cache_dir.join(&file.hash);
-            if !hash_path.exists() || !self.verify_file(&file.hash, &file.hash).await? {
+            let relative_path = hash_to_filename(&file.hash);
+            let file_path = self.cache_dir.join(&relative_path);
+            
+            debug!("检查文件 {} (哈希值: {})", file.path, file.hash);
+            debug!("对应的本地路径: {}", file_path.display());
+            
+            if !file_path.exists() {
+                debug!("文件不存在: {}", file_path.display());
                 missing_files.push(file.clone());
+                continue;
             }
+            
+            match self.verify_file(&relative_path, &file.hash).await {
+                Ok(true) => {
+                    debug!("文件验证成功: {}", file.path);
+                },
+                Ok(false) => {
+                    warn!("文件验证失败: {} (哈希值不匹配)", file.path);
+                    missing_files.push(file.clone());
+                },
+                Err(e) => {
+                    error!("文件验证出错: {} - {}", file.path, e);
+                    missing_files.push(file.clone());
+                }
+            }
+        }
+        
+        if !missing_files.is_empty() {
+            info!("发现 {} 个缺失或损坏的文件", missing_files.len());
         }
         
         Ok(missing_files)

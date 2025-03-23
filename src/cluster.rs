@@ -25,7 +25,6 @@ use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
 
-// 定义一个常量用于存储User-Agent信息
 const USER_AGENT: &str = "openbmclapi-cluster/1.13.1 rust-openbmclapi-cluster";
 
 pub struct Cluster {
@@ -43,33 +42,28 @@ pub struct Cluster {
     tmp_dir: PathBuf,
     cert_key_files: Arc<RwLock<Option<(PathBuf, PathBuf)>>>,
     socket: Arc<RwLock<Option<SocketClient>>>,
-    user_agent: String, // 添加一个字段存储完整的User-Agent字符串
+    user_agent: String,
 }
 
 impl Cluster {
     pub fn new(version: &str, token_manager: Arc<TokenManager>) -> Result<Self> {
         let config = CONFIG.read().unwrap().clone();
         
-        // 添加调试输出
         info!("DEBUG: Cluster创建，传入版本号: {}", version);
         
-        // 创建完整的User-Agent字符串
         let user_agent = format!("{}/{}", USER_AGENT, version);
         info!("DEBUG: Cluster UA: {}", user_agent);
         
-        // 创建HTTP客户端
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(&user_agent)
             .build()?;
         
-        // 获取配置的存储
         let storage = Arc::new(get_storage(&config));
         
         let base_url = std::env::var("CLUSTER_BMCLAPI")
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
             
-        // 创建临时目录
         let tmp_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".ssl");
         std::fs::create_dir_all(&tmp_dir)?;
         
@@ -95,16 +89,13 @@ impl Cluster {
     pub async fn init(&self) -> Result<()> {
         self.storage.init().await?;
         
-        // 处理UPnP端口映射
         let config = CONFIG.read().unwrap().clone();
         if config.enable_upnp {
             match upnp::setup_upnp(config.port, config.cluster_public_port).await {
                 Ok(ip) => {
-                    // 检查IP是否为公网IP
                     if upnp::is_public_ip(&ip) {
                         info!("UPnP端口映射成功，外网IP: {}", ip);
                         
-                        // 如果未指定集群IP，则使用UPnP获取的IP
                         if self.host.is_none() {
                             let mut config = CONFIG.write().unwrap();
                             config.cluster_ip = Some(ip);
@@ -131,13 +122,11 @@ impl Cluster {
     }
     
     pub async fn request_cert(&self) -> bool {
-        // 获取当前的socket连接
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回false
         let socket = match socket_opt {
             Some(socket) => socket,
             None => {
@@ -163,8 +152,6 @@ impl Cluster {
                             return;
                         }
                         
-                        // 根据实际返回的格式: [Array [Array [Null, Object {...}]]]
-                        // 获取最外层的数组
                         let outer_array = match values.get(0) {
                             Some(array) if array.is_array() => array.as_array().unwrap(),
                             _ => {
@@ -173,7 +160,6 @@ impl Cluster {
                             }
                         };
                         
-                        // 获取内层的数组
                         let inner_array = match outer_array.get(0) {
                             Some(array) if array.is_array() => array.as_array().unwrap(),
                             _ => {
@@ -182,20 +168,17 @@ impl Cluster {
                             }
                         };
                         
-                        // 检查内层数组长度是否至少为2
                         if inner_array.len() < 2 {
                             error!("证书响应格式错误: 内层数组长度不足，需要至少两个元素");
                             return;
                         }
                         
-                        // 第二个元素应该是包含证书和密钥的对象
                         let cert_data = &inner_array[1];
                         if !cert_data.is_object() {
                             error!("证书响应格式错误: 内层数组的第二个元素不是对象，实际值: {:?}", cert_data);
                             return;
                         }
                         
-                        // 从对象中提取证书和密钥
                         let cert = cert_data.get("cert");
                         let key = cert_data.get("key");
                         
@@ -213,14 +196,12 @@ impl Cluster {
                             return;
                         }
                         
-                        // 准备文件路径
                         let cert_file = tmp_dir.join("cert.pem");
                         let key_file = tmp_dir.join("key.pem");
                         
                         debug!("准备保存证书到: {:?}", cert_file);
                         debug!("准备保存密钥到: {:?}", key_file);
                         
-                        // 确保目录存在
                         if let Some(parent) = cert_file.parent() {
                             if !parent.exists() {
                                 match tokio::fs::create_dir_all(parent).await {
@@ -233,7 +214,6 @@ impl Cluster {
                             }
                         }
                         
-                        // 如果文件已存在，先删除
                         if cert_file.exists() {
                             if let Err(e) = tokio::fs::remove_file(&cert_file).await {
                                 error!("删除现有证书文件失败: {}", e);
@@ -246,7 +226,6 @@ impl Cluster {
                             }
                         }
 
-                        // 保存证书和密钥
                         let cert_str = cert.as_str().unwrap();
                         let key_str = key.as_str().unwrap();
                         
@@ -266,7 +245,6 @@ impl Cluster {
                             }
                         }
                         
-                        // 更新证书路径记录
                         let mut cert_files_guard = cert_key_files.write().unwrap();
                         *cert_files_guard = Some((cert_file.clone(), key_file.clone()));
                         info!("已更新证书和密钥文件路径记录");
@@ -283,7 +261,6 @@ impl Cluster {
             
         tokio::time::sleep(Duration::from_secs(5)).await;
         
-        // 验证证书文件是否存在
         let cert_files = self.cert_key_files.read().unwrap();
         let file_exists = if let Some((cert_path, key_path)) = &*cert_files {
             let cert_exists = std::path::Path::new(cert_path).exists();
@@ -325,30 +302,23 @@ impl Cluster {
         let ssl_cert = config.ssl_cert.unwrap();
         let ssl_key = config.ssl_key.unwrap();
         
-        // 目标路径
         let cert_path = self.tmp_dir.join("cert.pem");
         let key_path = self.tmp_dir.join("key.pem");
         
         info!("使用自定义证书: {:?}", ssl_cert);
         
-        // 检查是文件路径还是证书内容
         if std::path::Path::new(&ssl_cert).exists() {
-            // 文件路径，复制到临时目录
             tokio::fs::copy(&ssl_cert, &cert_path).await?;
         } else {
-            // 证书内容，写入临时文件
             tokio::fs::write(&cert_path, ssl_cert).await?;
         }
         
         if std::path::Path::new(&ssl_key).exists() {
-            // 文件路径，复制到临时目录
             tokio::fs::copy(&ssl_key, &key_path).await?;
         } else {
-            // 证书内容，写入临时文件
             tokio::fs::write(&key_path, ssl_key).await?;
         }
         
-        // 更新证书路径
         {
             let mut cert_files = self.cert_key_files.write().unwrap();
             *cert_files = Some((cert_path, key_path));
@@ -360,7 +330,6 @@ impl Cluster {
     pub async fn setup_server_with_https(&self, use_https: bool) -> Result<Router> {
         let router = self.create_router();
         
-        // 如果使用HTTPS，确保证书已准备好
         if use_https {
             let cert_files = self.cert_key_files.read().unwrap();
             if cert_files.is_none() {
@@ -380,7 +349,6 @@ impl Cluster {
             .route("/files/:hash_path", get(serve_file))
             .route("/list/directory", get(
                 |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
-                    // 从URL中提取sign和path参数
                     let sign = params.get("sign");
                     let path = params.get("path").unwrap_or(&String::from("")).clone();
                     
@@ -391,16 +359,13 @@ impl Cluster {
                             .unwrap();
                     }
                 
-                    // 获取config的读锁
                     let cluster_secret = {
                         let config = CONFIG.read().unwrap();
                         config.cluster_secret.clone()
                     };
                     
-                    // 计算验证数据
                     let verify_path = format!("/list/directory?path={}", path);
                     
-                    // 构建查询参数
                     let mut query_map = HashMap::new();
                     query_map.insert("s".to_string(), sign.unwrap().to_string());
                     if let Some(e) = params.get("e") {
@@ -414,16 +379,13 @@ impl Cluster {
                             .unwrap();
                     }
                 
-                    // 获取存储实例
                     let _storage = cluster.get_storage();
                     let storage_path = std::path::Path::new("cache").join(&path);
                     
-                    // 异步读取目录内容
                     match tokio::fs::read_dir(storage_path).await {
                         Ok(mut entries) => {
                             let mut files = Vec::new();
                             
-                            // 读取目录中的所有条目
                             while let Ok(Some(entry)) = entries.next_entry().await {
                                 if let Ok(metadata) = entry.metadata().await {
                                     let entry_type = if metadata.is_dir() { "directory" } else { "file" };
@@ -438,7 +400,6 @@ impl Cluster {
                                 }
                             }
                             
-                            // 返回JSON响应
                             Response::builder()
                                 .status(StatusCode::OK)
                                 .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -459,7 +420,6 @@ impl Cluster {
             ))
             .route("/metrics", get(
                 |State(cluster): State<Arc<Cluster>>, Query(params): axum::extract::Query<HashMap<String, String>>| async move {
-                    // 从URL中提取sign参数
                     let sign = params.get("sign");
                     if sign.is_none() {
                         return Response::builder()
@@ -468,16 +428,13 @@ impl Cluster {
                             .unwrap();
                     }
                 
-                    // 获取config的读锁并立即释放，避免Send问题
                     let cluster_secret = {
                         let config = CONFIG.read().unwrap();
                         config.cluster_secret.clone()
                     };
                     
-                    // 计算验证数据
                     let path = "/metrics";
                     
-                    // 构建查询参数
                     let mut query_map = HashMap::new();
                     query_map.insert("s".to_string(), sign.unwrap().to_string());
                     if let Some(e) = params.get("e") {
@@ -491,10 +448,8 @@ impl Cluster {
                             .unwrap();
                     }
                 
-                    // 获取计数器
                     let counters = cluster.counters.read().unwrap().clone();
                     
-                    // 返回JSON响应
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -512,12 +467,10 @@ impl Cluster {
     }
     
     pub async fn enable(&self) -> Result<()> {
-        // 检查是否已启用
         if *self.is_enabled.read().unwrap() {
             return Ok(());
         }
         
-        // 设置状态为希望启用
         {
             let mut want_enable = self.want_enable.write().unwrap();
             *want_enable = true;
@@ -525,19 +478,16 @@ impl Cluster {
         
         info!("启用集群...");
         
-        // 获取当前的socket连接
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回错误
         let socket = match socket_opt {
             Some(socket) => socket,
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 获取IP和端口
         let public_ip = match Self::find_public_ip().await {
             Ok(ip) => ip,
             Err(e) => {
@@ -548,7 +498,6 @@ impl Cluster {
         
         info!("获取到公网IP地址: {}", public_ip);
         
-        // 准备payload
         let host = self.host.clone().unwrap_or_else(|| public_ip);
         let payload = json!({
             "host": host,
@@ -558,10 +507,8 @@ impl Cluster {
         
         debug!("发送的payload: {}", payload);
         
-        // 准备用于持有结果的变量
         let is_enabled = self.is_enabled.clone();
         
-        // 创建回调函数
         let ack_callback = move |message: Payload, _| {
             let is_enabled = is_enabled.clone();
             async move {
@@ -575,7 +522,6 @@ impl Cluster {
                             return;
                         }
                         
-                        // 检查错误
                         if !values[0].is_null() {
                             if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
                                 error!("启用集群失败: {}", err_msg);
@@ -586,13 +532,11 @@ impl Cluster {
                             }
                         }
                         
-                        // 检查确认
                         if values[1].as_bool() != Some(true) {
                             error!("节点注册失败: 未收到成功确认");
                             return;
                         }
                         
-                        // 设置状态为已启用
                         {
                             let mut is_enabled_guard = is_enabled.write().unwrap();
                             *is_enabled_guard = true;
@@ -604,13 +548,11 @@ impl Cluster {
             }.boxed()
         };
         
-        // 发送enable事件并等待回调
         info!("发送启用请求...");
         let res = socket
             .emit_with_ack("enable", payload, Duration::from_secs(300), ack_callback)
             .await;
             
-        // 等待一段时间以确保回调有机会处理
         tokio::time::sleep(Duration::from_secs(5)).await;
         
         if res.is_err() {
@@ -618,7 +560,6 @@ impl Cluster {
             return Err(anyhow!("发送启用请求失败"));
         }
         
-        // 检查状态是否已更新为启用
         if !*self.is_enabled.read().unwrap() {
             return Err(anyhow!("节点注册失败或超时"));
         }
@@ -627,33 +568,27 @@ impl Cluster {
     }
     
     pub async fn disable(&self) -> Result<()> {
-        // 检查是否已禁用
         if !*self.is_enabled.read().unwrap() {
             return Ok(());
         }
         
-        // 设置状态为不希望启用
         {
             let mut want_enable = self.want_enable.write().unwrap();
             *want_enable = false;
         }
         
-        // 获取当前的socket连接
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回错误
         let socket = match socket_opt {
             Some(socket) => socket,
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 准备用于持有结果的变量
         let is_enabled = self.is_enabled.clone();
         
-        // 创建回调函数
         let ack_callback = move |message: Payload, _| {
             let is_enabled = is_enabled.clone();
             async move {
@@ -667,7 +602,6 @@ impl Cluster {
                             return;
                         }
                         
-                        // 检查错误
                         if !values[0].is_null() {
                             if let Some(err_msg) = values[0].get("message").and_then(|v| v.as_str()) {
                                 error!("禁用集群失败: {}", err_msg);
@@ -678,13 +612,11 @@ impl Cluster {
                             }
                         }
                         
-                        // 检查确认
                         if values[1].as_bool() != Some(true) {
                             error!("节点禁用失败: 未收到成功确认");
                             return;
                         }
                         
-                        // 设置状态为已禁用
                         {
                             let mut is_enabled_guard = is_enabled.write().unwrap();
                             *is_enabled_guard = false;
@@ -696,13 +628,11 @@ impl Cluster {
             }.boxed()
         };
         
-        // 发送disable事件并等待回调
         info!("发送禁用请求...");
         let res = socket
             .emit_with_ack("disable", json!(null), Duration::from_secs(30), ack_callback)
             .await;
             
-        // 等待一段时间以确保回调有机会处理
         tokio::time::sleep(Duration::from_secs(3)).await;
         
         if res.is_err() {
@@ -710,7 +640,6 @@ impl Cluster {
             return Err(anyhow!("发送禁用请求失败"));
         }
         
-        // 检查状态是否已更新为禁用
         if *self.is_enabled.read().unwrap() {
             return Err(anyhow!("节点禁用失败或超时"));
         }
@@ -731,33 +660,28 @@ impl Cluster {
             "version": env!("CARGO_PKG_VERSION"),
         });
         
-        // 获取当前的socket连接
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回错误
         let socket = match socket_opt {
             Some(socket) => socket,
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 创建回调函数
         let ack_callback = move |message: Payload, _| {
             async move {
                 debug!("收到heartbeat响应回调");
                 match message {
                     Payload::Text(values) => {
                         debug!("处理heartbeat响应的文本数据: {:?}", values);
-                        // 心跳通常不需要处理响应数据，只需要确认服务器收到了请求
                     },
                     _ => error!("收到非文本格式的heartbeat响应: {:?}", message),
                 }
             }.boxed()
         };
         
-        // 发送heartbeat事件并等待回调
         debug!("发送心跳...");
         let res = socket
             .emit_with_ack("heartbeat", payload, Duration::from_secs(5), ack_callback)
@@ -772,19 +696,15 @@ impl Cluster {
         Ok(())
     }
     
-    // 添加新的connect方法，实现持久Socket.IO连接和重连机制
     pub async fn connect(&self) -> Result<()> {
         info!("正在建立Socket.IO持久连接到 {}...", self.base_url);
         
-        // 获取认证令牌
         let token = self.token_manager.get_token().await?;
         
-        // 创建新的Socket.IO客户端
         let mut socket_builder = ClientBuilder::new(&self.base_url)
             .transport_type(TransportType::Websocket)
             .auth(json!({"token": token}));
         
-        // 连接事件
         socket_builder = socket_builder.on("connect", {
             let cluster = self.clone();
             move |_: Payload, _: SocketClient| {
@@ -792,12 +712,10 @@ impl Cluster {
                 async move {
                     info!("Socket.IO连接已建立 - 收到connect事件");
                     
-                    // 记录当前状态
                     let is_enabled = *cluster.is_enabled.read().unwrap();
                     let want_enable = *cluster.want_enable.read().unwrap();
                     info!("当前集群状态 - 是否启用: {}, 是否希望启用: {}", is_enabled, want_enable);
                     
-                    // 如果之前已启用但因连接断开而停用，则自动重新启用
                     if *cluster.want_enable.read().unwrap() && !*cluster.is_enabled.read().unwrap() {
                         info!("检测到连接重新建立，且want_enable=true但is_enabled=false，将尝试重新启用集群");
                         let cluster_clone = cluster.clone();
@@ -818,28 +736,22 @@ impl Cluster {
             }
         });
         
-        // 打印连接配置信息
         info!("Socket.IO配置: URL={}, 传输类型=Websocket", self.base_url);
         
-        // 尝试连接
         match socket_builder.connect().await {
             Ok(socket) => {
                 info!("Socket.IO连接已建立，准备认证");
                 
-                // 等待连接稳定
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 
-                // 保存到共享变量
                 {
                     let mut socket_guard = self.socket.write().unwrap();
                     *socket_guard = Some(socket.clone());
                     debug!("已将新的Socket.IO连接保存到共享状态");
                 }
                 
-                // 记录基本连接信息
                 info!("Socket.IO连接已完成初始化并保存");
                 
-                // 启动keep-alive定时任务
                 let cluster = self.clone();
                 tokio::spawn(async move {
                     cluster.start_keepalive_task().await;
@@ -850,7 +762,6 @@ impl Cluster {
             Err(e) => {
                 error!("Socket.IO连接失败: {}，错误详情: {:?}", e, e);
                 
-                // 根据错误消息提供更多具体信息
                 let err_str = e.to_string();
                 if err_str.contains("timeout") {
                     error!("连接超时 - 请检查网络连接和服务器状态");
@@ -862,26 +773,21 @@ impl Cluster {
                     error!("认证错误 - 请检查令牌是否有效");
                 }
                 
-                // 尝试重新连接
                 info!("将在5秒后尝试重新连接");
                 
-                // 创建一个不依赖于self的重连逻辑
                 let base_url = self.base_url.clone();
                 let token_manager = self.token_manager.clone();
                 let want_enable = Arc::clone(&self.want_enable);
                 let _is_enabled = Arc::clone(&self.is_enabled);
                 
-                // 不再使用rx/tx通道，直接在tokio::spawn中尝试重连
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     
-                    // 先检查是否还想要启用
                     if !*want_enable.read().unwrap() {
                         debug!("集群已不再需要连接，取消重连");
                         return;
                     }
                     
-                    // 获取令牌
                     let token = match token_manager.get_token().await {
                         Ok(t) => t,
                         Err(e) => {
@@ -890,7 +796,6 @@ impl Cluster {
                         }
                     };
                     
-                    // 尝试重连
                     info!("正在尝试Socket.IO重新连接到 {}...", base_url);
                     match ClientBuilder::new(&base_url)
                         .transport_type(TransportType::Websocket)
@@ -899,7 +804,6 @@ impl Cluster {
                     {
                         Ok(_socket) => {
                             info!("Socket.IO重连成功，连接已建立");
-                            // 后续处理将由connect事件监听器完成
                         },
                         Err(e) => error!("Socket.IO重新连接失败: {}，错误详情: {:?}", e, e)
                     }
@@ -910,13 +814,11 @@ impl Cluster {
         }
     }
     
-    // 添加新的定时发送keep-alive的方法
     async fn start_keepalive_task(&self) {
         info!("启动keep-alive定时任务 (间隔60秒)");
         let mut failed_keepalive = 0;
         
         while *self.is_enabled.read().unwrap() {
-            // 等待60秒
             debug!("等待60秒后发送下一次keep-alive...");
             tokio::time::sleep(Duration::from_secs(60)).await;
             debug!("keep-alive计时结束，准备发送keep-alive");
@@ -926,13 +828,11 @@ impl Cluster {
                 break;
             }
             
-            // 获取当前计数器数据
             let current_counter = {
                 let counters = self.counters.read().unwrap();
                 counters.clone()
             };
             
-            // 准备发送的数据
             let start_time = chrono::Utc::now().timestamp() * 1000;
             let payload = json!({
                 "hits": current_counter.hits,
@@ -940,7 +840,6 @@ impl Cluster {
                 "time": start_time
             });
             
-            // 获取socket
             let socket_opt = {
                 let socket_guard = self.socket.read().unwrap();
                 socket_guard.clone()
@@ -949,12 +848,10 @@ impl Cluster {
             if let Some(socket) = socket_opt {
                 debug!("发送keep-alive数据: {:?} (当前时间戳: {})", payload, start_time);
                 
-                // 获取计数器的可变引用
                 let counters = self.counters.clone();
                 let current_hits = current_counter.hits;
                 let current_bytes = current_counter.bytes;
                 
-                // 创建回调函数
                 let ack_callback = move |message: Payload, _| {
                     let counters = counters.clone();
                     let current_hits = current_hits;
@@ -965,7 +862,6 @@ impl Cluster {
                             Payload::Text(values) => {
                                 debug!("处理keep-alive响应的文本数据: {:?}", values);
                                 
-                                // 更新计数器，减去已报告的值
                                 {
                                     let mut counters_guard = counters.write().unwrap();
                                     counters_guard.hits -= current_hits;
@@ -981,10 +877,8 @@ impl Cluster {
                     }.boxed()
                 };
                 
-                // 发送keep-alive事件并等待回调
                 match socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), ack_callback).await {
                     Ok(_) => {
-                        // 发送成功，重置失败计数
                         if failed_keepalive > 0 {
                             info!("keep-alive发送成功，重置失败计数 (之前失败次数: {})", failed_keepalive);
                         } else {
@@ -999,12 +893,10 @@ impl Cluster {
                         
                         if failed_keepalive >= 3 {
                             error!("连续3次keep-alive失败，将禁用集群 (当前连接可能已断开)");
-                            // 在一个新的任务中禁用集群，避免死锁
                             let _cluster_id = self.token_manager.clone();
                             let want_enable = Arc::clone(&self.want_enable);
                             
                             tokio::spawn(async move {
-                                // 设置状态为不希望启用
                                 {
                                     let mut want_enable_guard = want_enable.write().unwrap();
                                     let previous = *want_enable_guard;
@@ -1032,7 +924,6 @@ impl Cluster {
             url = format!("{}?lastModified={}", url, lm);
         }
         
-        // 添加调试输出
         debug!("DEBUG: 发送请求到: {}", url);
         debug!("DEBUG: User-Agent: {}", self.user_agent);
         debug!("DEBUG: 版本号: {}", self.version);
@@ -1050,16 +941,21 @@ impl Cluster {
         }
         
         if response.status().is_success() {
-            // 检查内容类型，确定是否需要zstd解压缩
             let is_zstd = response.headers()
                 .get("content-type")
                 .map(|v| v.to_str().unwrap_or(""))
                 .unwrap_or("")
                 .contains("application/zstd");
+            
+            debug!("收到响应，内容类型: {}", 
+                response.headers().get("content-type")
+                    .map(|v| v.to_str().unwrap_or("未知"))
+                    .unwrap_or("无内容类型头"));
                 
             let bytes = response.bytes().await?;
+            debug!("接收到原始数据大小: {} 字节", bytes.len());
             
-            let json_bytes = if is_zstd {
+            let decompressed_bytes = if is_zstd {
                 debug!("收到zstd压缩的文件列表，进行解压缩处理...");
                 match zstd::decode_all(bytes.as_ref()) {
                     Ok(decoded) => {
@@ -1076,24 +972,22 @@ impl Cluster {
                 bytes.to_vec()
             };
             
-            // 解析JSON数据
-            match serde_json::from_slice::<Vec<FileInfo>>(&json_bytes) {
+            match Self::parse_avro_file_list(&decompressed_bytes) {
                 Ok(files) => {
                     info!("成功解析文件列表，共{}个文件", files.len());
                     Ok(FileList { files })
                 },
                 Err(e) => {
-                    error!("解析文件列表JSON失败: {}", e);
+                    error!("解析文件列表失败: {}", e);
                     
-                    // 尝试记录一部分JSON内容以帮助调试
-                    let preview = if json_bytes.len() > 100 {
-                        String::from_utf8_lossy(&json_bytes[0..100]).to_string() + "..."
+                    let preview = if decompressed_bytes.len() > 100 {
+                        String::from_utf8_lossy(&decompressed_bytes[0..100]).to_string() + "..."
                     } else {
-                        String::from_utf8_lossy(&json_bytes).to_string()
+                        String::from_utf8_lossy(&decompressed_bytes).to_string()
                     };
                     
-                    error!("JSON内容预览: {}", preview);
-                    Err(anyhow!("解析文件列表JSON失败: {}", e))
+                    error!("内容预览: {}", preview);
+                    Err(anyhow!("解析文件列表失败"))
                 }
             }
         } else {
@@ -1104,8 +998,198 @@ impl Cluster {
         }
     }
     
+    fn parse_avro_file_list(bytes: &[u8]) -> Result<Vec<FileInfo>> {
+        if bytes.len() < 8 {
+            return Err(anyhow!("数据太短，无法解析"));
+        }
+        
+        let mut cursor = std::io::Cursor::new(bytes);
+        
+        if let Ok(files) = Self::try_decode_avro_array(&mut cursor) {
+            if !files.is_empty() {
+                return Ok(files);
+            }
+        }
+        
+        for offset in [0, 4, 8, 16, 32, 64] {
+            if offset >= bytes.len() {
+                continue;
+            }
+            
+            cursor.set_position(offset as u64);
+            if let Ok(files) = Self::try_decode_avro_array(&mut cursor) {
+                if !files.is_empty() {
+                    debug!("在偏移量{}处成功解析到文件列表", offset);
+                    return Ok(files);
+                }
+            }
+        }
+        
+        let mut files = Vec::new();
+        cursor.set_position(0);
+        
+        while cursor.position() + 20 < bytes.len() as u64 {
+            let start_pos = cursor.position();
+            
+            if let Ok(Some(file)) = Self::try_decode_avro_record(&mut cursor) {
+                files.push(file);
+            } else {
+                cursor.set_position(start_pos + 1);
+            }
+            
+            if files.len() > 100000 {
+                break;
+            }
+        }
+        
+        if !files.is_empty() {
+            debug!("成功解析出{}个文件记录", files.len());
+            return Ok(files);
+        }
+        
+        match serde_json::from_slice::<Vec<FileInfo>>(bytes) {
+            Ok(json_files) => {
+                debug!("成功解析JSON格式文件列表，共{}个文件", json_files.len());
+                return Ok(json_files);
+            },
+            Err(e) => {
+                debug!("JSON解析失败: {}", e);
+            }
+        }
+        
+        Err(anyhow!("无法解析文件列表数据"))
+    }
+    
+    fn try_decode_avro_array(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Vec<FileInfo>> {
+        let start_pos = cursor.position();
+        
+        let array_size = match Self::read_avro_zigzag_long(cursor) {
+            Ok(size) if size > 0 && size < 100000 => size as usize,
+            _ => {
+                cursor.set_position(start_pos);
+                return Err(anyhow!("无效的Avro数组大小"));
+            }
+        };
+        
+        let mut files = Vec::with_capacity(array_size);
+        
+        for _ in 0..array_size {
+            match Self::try_decode_avro_record(cursor) {
+                Ok(Some(file)) => files.push(file),
+                _ => {
+                    cursor.set_position(start_pos);
+                    return Err(anyhow!("解析数组元素失败"));
+                }
+            }
+        }
+        
+        Ok(files)
+    }
+    
+    fn try_decode_avro_record(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Option<FileInfo>> {
+        let start_pos = cursor.position();
+        
+        let path = match Self::read_avro_string(cursor) {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                cursor.set_position(start_pos);
+                return Ok(None);
+            }
+        };
+        
+        let hash = match Self::read_avro_string(cursor) {
+            Ok(s) if !s.is_empty() && s.len() >= 32 => s,
+            _ => {
+                cursor.set_position(start_pos);
+                return Ok(None);
+            }
+        };
+        
+        let size = match Self::read_avro_zigzag_long(cursor) {
+            Ok(s) if s > 0 => s,
+            _ => {
+                cursor.set_position(start_pos);
+                return Ok(None);
+            }
+        };
+        
+        let mtime = match Self::read_avro_zigzag_long(cursor) {
+            Ok(m) if m > 0 => m,
+            _ => {
+                cursor.set_position(start_pos);
+                return Ok(None);
+            }
+        };
+        
+        if path.contains('/') && path.len() < 500 && hash.len() < 100 {
+            return Ok(Some(FileInfo {
+                path,
+                hash,
+                size,
+                mtime,
+            }));
+        }
+        
+        cursor.set_position(start_pos);
+        Ok(None)
+    }
+    
+    fn read_avro_string(cursor: &mut std::io::Cursor<&[u8]>) -> Result<String> {
+        use bytes::Buf;
+        
+        let len = Self::read_avro_zigzag_long(cursor)? as usize;
+        
+        if len == 0 || len > 10000 {
+            return Err(anyhow!("字符串长度不合理: {}", len));
+        }
+        
+        let remaining = cursor.get_ref().len() as u64 - cursor.position();
+        if remaining < len as u64 {
+            return Err(anyhow!("数据不足，无法读取完整字符串"));
+        }
+        
+        let mut buf = vec![0u8; len];
+        cursor.copy_to_slice(&mut buf);
+        
+        String::from_utf8(buf).map_err(|e| anyhow!("字符串解码失败: {}", e))
+    }
+    
+    fn read_avro_zigzag_long(cursor: &mut std::io::Cursor<&[u8]>) -> Result<u64> {
+        use bytes::Buf;
+        
+        if !cursor.has_remaining() {
+            return Err(anyhow!("没有更多数据可读"));
+        }
+        
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
+        
+        loop {
+            if !cursor.has_remaining() {
+                return Err(anyhow!("未完成的VarInt"));
+            }
+            
+            let b = cursor.get_u8();
+            value |= ((b & 0x7F) as u64) << shift;
+            
+            if b & 0x80 == 0 {
+                break;
+            }
+            
+            shift += 7;
+            if shift > 63 {
+                return Err(anyhow!("VarInt太长"));
+            }
+        }
+        
+        let decoded = (value >> 1) ^ (-(value as i64 & 1) as u64);
+        Ok(decoded as u64)
+    }
+    
     pub async fn get_configuration(&self) -> Result<OpenbmclapiAgentConfiguration> {
         let url = format!("{}/openbmclapi/configuration", self.base_url);
+        debug!("请求配置: {}", url);
+        
         let token = self.token_manager.get_token().await?;
         
         let response = self.client.get(&url)
@@ -1116,17 +1200,17 @@ impl Cluster {
             
         if response.status().is_success() {
             let json_value = response.json::<serde_json::Value>().await?;
+            debug!("获取配置成功: {}", json_value);
             
-            // 构造OpenbmclapiAgentConfiguration结构
-            let remote_url = json_value["remote_url"].as_str()
-                .ok_or_else(|| anyhow!("配置中缺少remote_url字段"))?
-                .to_string();
-                
-            let source = json_value["sync"]["source"].as_str()
+            let sync_value = json_value.get("sync").ok_or_else(|| anyhow!("配置中缺少sync字段"))?;
+            
+            let source = sync_value.get("source")
+                .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("配置中缺少sync.source字段"))?
                 .to_string();
                 
-            let concurrency = json_value["sync"]["concurrency"].as_u64()
+            let concurrency = sync_value.get("concurrency")
+                .and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow!("配置中缺少sync.concurrency字段"))?
                 as usize;
                 
@@ -1137,40 +1221,40 @@ impl Cluster {
             
             let config = OpenbmclapiAgentConfiguration {
                 sync: sync_config,
-                remote_url,
+                remote_url: "".to_string(),
             };
             
             Ok(config)
         } else {
             let status = response.status();
             let text = response.text().await?;
-            error!("获取配置失败: {} - {}", status, text);
-            Err(anyhow!("获取配置失败: {} - {}", status, text))
+            error!("获取服务器配置失败: {} - {}", status, text);
+            Err(anyhow!("获取服务器配置失败: {} - {}", status, text))
         }
     }
     
     pub async fn sync_files(&self, file_list: &FileList, sync_config: &OpenbmclapiAgentConfiguration) -> Result<()> {
-        // 检查存储状态
         if !self.storage.check().await? {
-            return Err(anyhow!("存储检查失败"));
+            return Err(anyhow!("存储异常"));
         }
         
-        // 获取缺失的文件
+        info!("正在检查缺失文件");
         let missing_files = self.storage.get_missing_files(&file_list.files).await?;
         
         if missing_files.is_empty() {
-            info!("没有需要同步的文件");
             return Ok(());
         }
         
-        info!("需要同步 {} 个文件", missing_files.len());
-        info!("同步策略: {:?}", sync_config);
+        info!("mismatch {} files, start syncing", missing_files.len());
+        info!("{:?} 同步策略", sync_config);
         
         let token = self.token_manager.get_token().await?;
         
-        // 并发下载文件
-        let concurrency = sync_config.sync.concurrency.max(1); // 确保并发数至少为1
-        let source = &sync_config.remote_url;
+        let parallel = sync_config.sync.concurrency;
+        let source = &sync_config.sync.source;
+        
+        let total_count = missing_files.len();
+        let mut success_count = 0;
         
         use futures::stream::{self, StreamExt};
         
@@ -1178,53 +1262,153 @@ impl Cluster {
             .map(|file| {
                 let client = self.client.clone();
                 let token = token.clone();
-                let source = source.clone();
                 let storage = self.storage.clone();
-                let user_agent = self.user_agent.clone();
+                let _source = source.clone();
+                let _base_url = self.base_url.clone();
                 
                 async move {
-                    // 构建下载URL
-                    let url = format!("{}/{}", source, file.path);
+                    info!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
                     
-                    // 下载文件
-                    let response = client.get(&url)
-                        .header("Authorization", format!("Bearer {}", token))
-                        .header("user-agent", &user_agent)
-                        .send()
-                        .await?;
+                    for retry in 0..10 {
+                        if retry > 0 {
+                            debug!("重试下载文件 {} (第{}次)", file.path, retry);
+                        }
                         
-                    if !response.status().is_success() {
-                        return Err(anyhow!("下载文件失败: {}", response.status()));
+                        let path = if file.path.starts_with('/') {
+                            file.path[1..].to_string()
+                        } else {
+                            file.path.clone()
+                        };
+                        
+                        let openbmclapi_url = &_base_url;
+                        
+                        let url = if openbmclapi_url.ends_with('/') {
+                            format!("{}{}", openbmclapi_url, path)
+                        } else {
+                            format!("{}/{}", openbmclapi_url, path)
+                        };
+                        
+                        debug!("获取文件重定向URL: {}", url);
+                        
+                        match client.get(&url)
+                            .header("Authorization", format!("Bearer {}", token))
+                            .send()
+                            .await {
+                            Ok(response) => {
+                                if response.status().is_success() {
+                                    match response.bytes().await {
+                                        Ok(bytes) => {
+                                            debug!("文件 {} 下载完成，大小: {} 字节", file.path, bytes.len());
+                                            
+                                            let is_file_correct = validate_file(&bytes, &file.hash);
+                                            if !is_file_correct {
+                                                error!("文件{}校验失败", file.path);
+                                                continue;
+                                            }
+                                            
+                                            let hash_path = hash_to_filename(&file.hash);
+                                            if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                                error!("保存文件 {} 失败: {}", file.path, e);
+                                                continue;
+                                            }
+                                            
+                                            debug!("文件 {} 同步成功", file.path);
+                                            return Ok(file.path.clone());
+                                        }
+                                        Err(e) => {
+                                            debug!("读取文件 {} 响应体失败: {}", file.path, e);
+                                        }
+                                    }
+                                } else if response.status().is_redirection() {
+                                    if let Some(location) = response.headers().get("location") {
+                                        if let Ok(redirect_url) = location.to_str() {
+                                            debug!("文件 {} 获取到重定向URL: {}", file.path, redirect_url);
+                                            
+                                            match client.get(redirect_url)
+                                                .send()
+                                                .await {
+                                                Ok(redirect_response) => {
+                                                    if redirect_response.status().is_success() {
+                                                        match redirect_response.bytes().await {
+                                                            Ok(bytes) => {
+                                                                debug!("文件 {} 从重定向URL下载完成，大小: {} 字节", file.path, bytes.len());
+                                                                
+                                                                let is_file_correct = validate_file(&bytes, &file.hash);
+                                                                if !is_file_correct {
+                                                                    error!("文件{}校验失败", file.path);
+                                                                    continue;
+                                                                }
+                                                                
+                                                                let hash_path = hash_to_filename(&file.hash);
+                                                                if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                                                    error!("保存文件 {} 失败: {}", file.path, e);
+                                                                    continue;
+                                                                }
+                                                                
+                                                                debug!("文件 {} 同步成功", file.path);
+                                                                return Ok(file.path.clone());
+                                                            }
+                                                            Err(e) => {
+                                                                debug!("读取重定向文件 {} 响应体失败: {}", file.path, e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        debug!("从重定向URL下载文件 {} 失败: HTTP {}", file.path, redirect_response.status());
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    debug!("请求重定向URL {} 失败: {}", redirect_url, e);
+                                                }
+                                            }
+                                        } else {
+                                            debug!("解析重定向URL失败");
+                                        }
+                                    } else {
+                                        debug!("重定向响应没有location头");
+                                    }
+                                } else {
+                                    debug!("下载文件 {} 失败: HTTP {}", file.path, response.status());
+                                }
+                            }
+                            Err(e) => {
+                                debug!("下载文件 {} 失败，正在重试: {}", file.path, e);
+                            }
+                        }
+                        
+                        if retry < 9 {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                     
-                    let content = response.bytes().await?;
-                    
-                    // 保存文件
-                    storage.write_file(file.hash.clone(), content.to_vec(), &file).await?;
-                    
-                    info!("同步文件完成: {}", file.path);
-                    
-                    Ok::<_, anyhow::Error>(())
+                    error!("下载文件 {} 失败，已重试多次", file.path);
+                    Err(anyhow!("下载文件 {} 失败", file.path))
                 }
             })
-            .buffer_unordered(concurrency)
-            .collect::<Vec<_>>()
+            .buffer_unordered(parallel)
+            .collect::<Vec<Result<String>>>()
             .await;
-            
-        // 检查结果
-        for result in results {
-            if let Err(e) = result {
-                error!("同步文件错误: {}", e);
-                return Err(anyhow!("同步文件过程中发生错误"));
+        
+        let mut has_error = false;
+        for result in &results {
+            if result.is_ok() {
+                success_count += 1;
+            } else {
+                has_error = true;
             }
         }
         
-        info!("文件同步完成");
-        Ok(())
+        info!("完成 {}/{} 文件", success_count, total_count);
+        
+        if has_error {
+            error!("同步失败");
+            Err(anyhow!("同步失败"))
+        } else {
+            info!("同步完成");
+            Ok(())
+        }
     }
     
     pub async fn gc_background(&self, file_list: &FileList) -> Result<()> {
-        // 在后台执行垃圾回收
         let files = file_list.files.clone();
         let storage = self.storage.clone();
         
@@ -1252,11 +1436,9 @@ impl Cluster {
         self.storage.clone()
     }
 
-    // 端口检查方法，与Node.js版本保持一致
     pub async fn port_check(&self) -> Result<()> {
         let host = self.host.clone().unwrap_or_else(|| "".to_string());
         
-        // 在await之前获取CONFIG中需要的值，避免在await点跨越持有锁
         let byoc = {
             let config = CONFIG.read().unwrap();
             config.byoc
@@ -1277,34 +1459,29 @@ impl Cluster {
             "noFastEnable": no_fast_enable,
             "flavor": flavor,
         });
-
-        // 获取当前的socket连接
+        
         let socket_opt = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
         };
         
-        // 如果没有现有连接，则返回错误
         let socket = match socket_opt {
             Some(socket) => socket,
             None => return Err(anyhow!("没有可用的Socket.IO连接，请先调用connect()方法建立连接")),
         };
         
-        // 创建回调函数
         let ack_callback = move |message: Payload, _| {
             async move {
                 info!("收到port-check响应回调");
                 match message {
                     Payload::Text(values) => {
                         info!("处理port-check响应的文本数据: {:?}", values);
-                        // 端口检查通常不需要处理响应数据，只需要确认服务器收到了请求
                     },
                     _ => error!("收到非文本格式的port-check响应: {:?}", message),
                 }
             }.boxed()
         };
         
-        // 发送port-check事件并等待回调
         info!("发送端口检查请求...");
         let res = socket
             .emit_with_ack("port-check", payload, Duration::from_secs(10), ack_callback)
@@ -1315,17 +1492,14 @@ impl Cluster {
             return Err(anyhow!("发送端口检查请求失败"));
         }
         
-        // 等待一段时间以确保回调有机会处理
         tokio::time::sleep(Duration::from_secs(2)).await;
         
         info!("端口检查请求已完成");
         Ok(())
     }
 
-    // 查找公网IP（未使用）
     #[allow(dead_code)]
     async fn find_public_ip() -> Result<String> {
-        // 首先检查是否启用UPnP及获取端口配置
         let enable_upnp = {
             let config = CONFIG.read().unwrap();
             config.enable_upnp
@@ -1336,7 +1510,6 @@ impl Cluster {
             (config.port, config.cluster_public_port)
         };
         
-        // 尝试通过UPnP获取
         if enable_upnp {
             info!("尝试通过UPnP获取公网IP...");
             match upnp::setup_upnp(port, public_port).await {
@@ -1347,14 +1520,12 @@ impl Cluster {
                 Err(e) => {
                     warn!("UPnP获取公网IP失败: {}", e);
                     warn!("将尝试使用在线IP查询服务获取公网IP");
-                    // 继续尝试其他方法
                 }
             }
         } else {
             info!("UPnP功能未启用，将尝试使用在线IP查询服务获取公网IP");
         }
         
-        // 使用IP查询服务
         let ip_services = [
             "https://api.ipify.org",
             "https://ifconfig.me/ip",
@@ -1393,7 +1564,6 @@ impl Cluster {
     }
 }
 
-// 克隆实现
 impl Clone for Cluster {
     fn clone(&self) -> Self {
         Cluster {
@@ -1416,7 +1586,6 @@ impl Clone for Cluster {
     }
 }
 
-// 为Cluster手动实现Debug
 impl std::fmt::Debug for Cluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cluster")
@@ -1432,7 +1601,6 @@ impl std::fmt::Debug for Cluster {
     }
 }
 
-// 文件服务处理函数
 async fn serve_file(
     State(cluster): State<Arc<Cluster>>,
     Path(hash_path): Path<String>,
@@ -1440,22 +1608,17 @@ async fn serve_file(
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
-    // 从路径中提取哈希值
     let hash = hash_path.split('/').last().unwrap_or(&hash_path).to_string();
     
-    // 创建一个空的字节请求
     let empty_req = Request::new(&[] as &[u8]);
     
-    // 请求处理
     match storage.as_ref().handle_bytes_request(&hash_path, empty_req).await {
         Ok(mut response) => {
-            // 添加x-bmclapi-hash响应头
             let headers = response.headers_mut();
             if let Ok(header_value) = axum::http::HeaderValue::from_str(&hash) {
                 headers.insert("x-bmclapi-hash", header_value);
             }
             
-            // 获取文件大小并更新计数器
             if let Some(content_length) = response.headers().get(axum::http::header::CONTENT_LENGTH) {
                 if let Ok(size) = content_length.to_str().unwrap_or("0").parse::<u64>() {
                     let mut counters = cluster.counters.write().unwrap();
@@ -1476,22 +1639,18 @@ async fn serve_file(
     }
 }
 
-// 尝试重新连接集群（未使用）
 #[allow(dead_code)]
 async fn try_reconnect(cluster: &Cluster) -> Result<(), anyhow::Error> {
-    // 如果集群已经不想启用，则直接返回
     if !*cluster.want_enable.read().unwrap() {
         return Ok(());
     }
     
     info!("尝试重新连接服务器...");
     
-    // 直接调用connect方法
     match cluster.connect().await {
         Ok(_) => {
             info!("集群连接已恢复");
             
-            // 如果之前希望启用但现在处于禁用状态，connect中的connect事件处理器会自动处理重新启用
             Ok(())
         },
         Err(e) => {
@@ -1499,4 +1658,16 @@ async fn try_reconnect(cluster: &Cluster) -> Result<(), anyhow::Error> {
             Err(anyhow!("重新连接失败: {}", e))
         }
     }
+}
+
+fn validate_file(data: &[u8], hash: &str) -> bool {
+    use sha1::{Sha1, Digest};
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    let calculated_hash = format!("{:x}", hasher.finalize());
+    calculated_hash == hash.to_lowercase()
+}
+
+fn hash_to_filename(hash: &str) -> String {
+    format!("{}/{}", &hash[0..2], hash)
 } 

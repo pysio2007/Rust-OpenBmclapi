@@ -156,6 +156,7 @@ lazy_static! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenbmclapiAgentConfiguration {
     pub sync: SyncConfig,
+    #[serde(default)]  // 添加 default 属性，使其可选
     pub remote_url: String,
 }
 

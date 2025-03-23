@@ -55,3 +55,5 @@ rustls = "0.22"
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.0"
 async-stream = "0.3"
+# AVRO格式解析
+apache-avro = "0.16"

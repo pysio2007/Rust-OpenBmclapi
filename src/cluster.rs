@@ -738,13 +738,20 @@ async fn find_public_ip() -> Result<String> {
         let port = CONFIG.read().unwrap().port;
         let public_port = CONFIG.read().unwrap().cluster_public_port;
         
+        info!("尝试通过UPnP获取公网IP...");
         match upnp::setup_upnp(port, public_port).await {
-            Ok(ip) => return Ok(ip),
+            Ok(ip) => {
+                info!("成功通过UPnP获取公网IP: {}", ip);
+                return Ok(ip);
+            },
             Err(e) => {
                 warn!("UPnP获取公网IP失败: {}", e);
+                warn!("将尝试使用在线IP查询服务获取公网IP");
                 // 继续尝试其他方法
             }
         }
+    } else {
+        info!("UPnP功能未启用，将尝试使用在线IP查询服务获取公网IP");
     }
     
     // 使用IP查询服务
@@ -754,25 +761,35 @@ async fn find_public_ip() -> Result<String> {
         "https://icanhazip.com",
     ];
     
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     
     for service in ip_services {
+        info!("尝试从 {} 获取公网IP...", service);
         match client.get(service).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     if let Ok(ip) = response.text().await {
                         let ip = ip.trim();
                         if !ip.is_empty() {
+                            info!("成功从 {} 获取公网IP: {}", service, ip);
                             return Ok(ip.to_string());
                         }
                     }
+                } else {
+                    warn!("从 {} 获取IP失败，HTTP状态码: {}", service, response.status());
                 }
             },
-            Err(_) => continue,
+            Err(e) => {
+                warn!("从 {} 获取IP失败: {}", service, e);
+                continue;
+            }
         }
     }
     
-    Err(anyhow!("无法获取公网IP"))
+    error!("无法通过任何方式获取公网IP");
+    Err(anyhow!("无法获取公网IP，请手动在配置中指定CLUSTER_IP"))
 }
 
 // 测速处理函数

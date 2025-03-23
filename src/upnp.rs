@@ -7,6 +7,7 @@ use igd::{self, Gateway, SearchOptions};
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: u64 = 5;
+const GATEWAY_SEARCH_TIMEOUT: u64 = 10; // 搜索网关的超时时间，单位为秒
 
 // 创建Gateway的包装器，实现Clone
 struct GatewayWrapper {
@@ -90,21 +91,48 @@ impl Clone for GatewayWrapper {
 pub async fn setup_upnp(port: u16, public_port: u16) -> Result<String> {
     info!("正在设置UPnP映射...");
     
-    // 创建搜索选项，设置超时为5秒
-    let search_options = SearchOptions {
-        timeout: Some(Duration::from_secs(5)),
-        ..Default::default()
-    };
+    // 尝试搜索网关设备，使用多次尝试
+    let mut gateway_result = Err(anyhow!("未进行UPnP网关搜索"));
+    let mut retries = 0;
     
-    // 使用tokio运行时执行阻塞操作
-    let gateway_result = tokio::task::spawn_blocking(move || {
-        igd::search_gateway(search_options)
-    }).await?;
+    while retries < MAX_RETRIES {
+        // 创建搜索选项，增加超时时间
+        let search_options = SearchOptions {
+            timeout: Some(Duration::from_secs(GATEWAY_SEARCH_TIMEOUT)),
+            ..Default::default()
+        };
+        
+        // 使用tokio运行时执行阻塞操作
+        match tokio::task::spawn_blocking(move || {
+            info!("开始搜索UPnP网关设备（尝试 {}/{}）...", retries + 1, MAX_RETRIES);
+            igd::search_gateway(search_options)
+        }).await {
+            Ok(Ok(gateway)) => {
+                info!("找到UPnP网关设备: {}", gateway.addr);
+                gateway_result = Ok(gateway);
+                break;
+            },
+            Ok(Err(e)) => {
+                warn!("UPnP设备搜索失败 (尝试 {}/{}): {}", retries + 1, MAX_RETRIES, e);
+                retries += 1;
+                if retries < MAX_RETRIES {
+                    tokio::time::sleep(Duration::from_secs(RETRY_DELAY)).await;
+                }
+            },
+            Err(e) => {
+                warn!("UPnP设备搜索任务失败 (尝试 {}/{}): {}", retries + 1, MAX_RETRIES, e);
+                retries += 1;
+                if retries < MAX_RETRIES {
+                    tokio::time::sleep(Duration::from_secs(RETRY_DELAY)).await;
+                }
+            }
+        }
+    }
     
     let gateway = match gateway_result {
         Ok(gateway) => GatewayWrapper::new(gateway),
         Err(e) => {
-            error!("UPnP设备搜索失败: {}", e);
+            error!("UPnP设备搜索最终失败: {}", e);
             return Err(anyhow!("UPnP设备搜索失败: {}", e));
         }
     };

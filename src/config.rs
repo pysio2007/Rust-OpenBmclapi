@@ -56,9 +56,16 @@ impl Config {
                  CLUSTER_ID=\n\
                  # 请替换为你的CLUSTER_SECRET（必填）\n\
                  CLUSTER_SECRET=\n\
-                 # CLUSTER_IP=请设置你的公网IP或内网IP\n\
-                 # CLUSTER_PORT=4000\n\
+                 # 是否启用UPnP自动端口映射功能（可选，默认关闭）\n\
+                 # 如果你的路由器支持UPnP且需要自动端口映射，设置为true\n\
                  # ENABLE_UPNP=false\n\
+                 # 设置你的公网IP或内网IP（可选）\n\
+                 # CLUSTER_IP=\n\
+                 # 设置服务监听端口（可选，默认4000）\n\
+                 # CLUSTER_PORT=4000\n\
+                 # 设置对外公开的端口（可选，默认与监听端口相同）\n\
+                 # CLUSTER_PUBLIC_PORT=4000\n\
+                 # 是否启用指标收集（可选，默认关闭）\n\
                  # ENABLE_METRICS=false\n";
             
             fs::write(env_path, env_content)?;

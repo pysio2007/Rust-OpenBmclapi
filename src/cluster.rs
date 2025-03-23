@@ -1033,10 +1033,52 @@ impl Cluster {
         }
         
         if response.status().is_success() {
+            // 检查内容类型，确定是否需要zstd解压缩
+            let is_zstd = response.headers()
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or(""))
+                .unwrap_or("")
+                .contains("application/zstd");
+                
             let bytes = response.bytes().await?;
-            // 注意：原始实现使用了zstd解压缩，这里简化处理
-            let files: Vec<FileInfo> = serde_json::from_slice(&bytes)?;
-            Ok(FileList { files })
+            
+            let json_bytes = if is_zstd {
+                info!("收到zstd压缩的文件列表，进行解压缩处理...");
+                match zstd::decode_all(bytes.as_ref()) {
+                    Ok(decoded) => {
+                        info!("zstd解压缩成功，解压后大小: {}字节", decoded.len());
+                        decoded
+                    },
+                    Err(e) => {
+                        error!("zstd解压缩失败: {}", e);
+                        return Err(anyhow!("zstd解压缩失败: {}", e));
+                    }
+                }
+            } else {
+                info!("收到未压缩的文件列表");
+                bytes.to_vec()
+            };
+            
+            // 解析JSON数据
+            match serde_json::from_slice::<Vec<FileInfo>>(&json_bytes) {
+                Ok(files) => {
+                    info!("成功解析文件列表，共{}个文件", files.len());
+                    Ok(FileList { files })
+                },
+                Err(e) => {
+                    error!("解析文件列表JSON失败: {}", e);
+                    
+                    // 尝试记录一部分JSON内容以帮助调试
+                    let preview = if json_bytes.len() > 100 {
+                        String::from_utf8_lossy(&json_bytes[0..100]).to_string() + "..."
+                    } else {
+                        String::from_utf8_lossy(&json_bytes).to_string()
+                    };
+                    
+                    error!("JSON内容预览: {}", preview);
+                    Err(anyhow!("解析文件列表JSON失败: {}", e))
+                }
+            }
         } else {
             let status = response.status();
             let text = response.text().await?;

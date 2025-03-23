@@ -25,6 +25,9 @@ use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
 
+// 定义一个常量用于存储User-Agent信息
+const USER_AGENT: &str = "rust-openbmclapi-cluster";
+
 pub struct Cluster {
     client: Client,
     storage: Arc<Box<dyn Storage>>,
@@ -40,16 +43,20 @@ pub struct Cluster {
     tmp_dir: PathBuf,
     cert_key_files: Arc<RwLock<Option<(PathBuf, PathBuf)>>>,
     socket: Arc<RwLock<Option<SocketClient>>>,
+    user_agent: String, // 添加一个字段存储完整的User-Agent字符串
 }
 
 impl Cluster {
     pub fn new(version: &str, token_manager: Arc<TokenManager>) -> Result<Self> {
         let config = CONFIG.read().unwrap().clone();
         
+        // 创建完整的User-Agent字符串
+        let user_agent = format!("{}/{}", USER_AGENT, version);
+        
         // 创建HTTP客户端
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(format!("rust-openbmclapi-cluster/{}", "1.13.1"))
+            .user_agent(&user_agent)
             .build()?;
         
         // 获取配置的存储
@@ -77,6 +84,7 @@ impl Cluster {
             tmp_dir,
             cert_key_files: Arc::new(RwLock::new(None)),
             socket: Arc::new(RwLock::new(None)),
+            user_agent,
         })
     }
     
@@ -541,7 +549,7 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": "1.13.1",
+            "version": env!("CARGO_PKG_VERSION"),
         });
         
         info!("发送的payload: {}", payload);
@@ -716,7 +724,7 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": "1.13.1",
+            "version": env!("CARGO_PKG_VERSION"),
         });
         
         // 获取当前的socket连接
@@ -1024,7 +1032,7 @@ impl Cluster {
         
         let response = self.client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
+            .header("user-agent", &self.user_agent)
             .send()
             .await?;
             
@@ -1093,7 +1101,7 @@ impl Cluster {
         
         let response = self.client.get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
+            .header("user-agent", &self.user_agent)
             .send()
             .await?;
             
@@ -1163,6 +1171,7 @@ impl Cluster {
                 let token = token.clone();
                 let source = source.clone();
                 let storage = self.storage.clone();
+                let user_agent = self.user_agent.clone();
                 
                 async move {
                     // 构建下载URL
@@ -1171,7 +1180,7 @@ impl Cluster {
                     // 下载文件
                     let response = client.get(&url)
                         .header("Authorization", format!("Bearer {}", token))
-                        .header("user-agent", format!("rust-openbmclapi-cluster/{}", "1.13.1"))
+                        .header("user-agent", &user_agent)
                         .send()
                         .await?;
                         
@@ -1254,7 +1263,7 @@ impl Cluster {
         let payload = json!({
             "host": host,
             "port": self.public_port,
-            "version": "1.13.1",
+            "version": env!("CARGO_PKG_VERSION"),
             "byoc": byoc,
             "noFastEnable": no_fast_enable,
             "flavor": flavor,
@@ -1393,6 +1402,7 @@ impl Clone for Cluster {
             tmp_dir: self.tmp_dir.clone(),
             cert_key_files: self.cert_key_files.clone(),
             socket: self.socket.clone(),
+            user_agent: self.user_agent.clone(),
         }
     }
 }

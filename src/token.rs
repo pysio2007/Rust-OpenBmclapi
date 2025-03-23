@@ -10,6 +10,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+// 定义一个常量用于存储User-Agent基础信息
+const USER_AGENT: &str = "rust-openbmclapi-cluster";
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Challenge {
     challenge: String,
@@ -29,6 +32,7 @@ pub struct TokenManager {
     token: Arc<RwLock<Option<String>>>,
     client: Client,
     prefix_url: String,
+    user_agent: String, // 添加一个字段存储完整的User-Agent字符串
 }
 
 impl TokenManager {
@@ -36,20 +40,25 @@ impl TokenManager {
         let prefix_url = env::var("CLUSTER_BMCLAPI")
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
         
+        // 创建完整的User-Agent字符串
+        let version = env!("CARGO_PKG_VERSION");
+        let user_agent = format!("{}/{}", USER_AGENT, version);
+        
         // 创建HTTP客户端
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(format!("openbmclapi-cluster/{}", "1.13.1")) // 硬编码版本号
+            .user_agent(&user_agent)
             .build()
             .unwrap_or_else(|_| Client::new());
 
         TokenManager {
             cluster_id,
             cluster_secret,
-            version: "1.13.1".to_string(),
+            version: version.to_string(),
             token: Arc::new(RwLock::new(None)),
             client,
             prefix_url,
+            user_agent,
         }
     }
 
@@ -71,7 +80,7 @@ impl TokenManager {
         let response = self.client
             .get(&challenge_url)
             .query(&[("clusterId", &self.cluster_id)])
-            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
+            .header("user-agent", &self.user_agent)
             .send()
             .await?;
 
@@ -96,7 +105,7 @@ impl TokenManager {
                 "challenge": challenge.challenge,
                 "signature": signature,
             }))
-            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
+            .header("user-agent", &self.user_agent)
             .send()
             .await?;
 
@@ -123,6 +132,7 @@ impl TokenManager {
         let token = self.token.clone();
         let client = self.client.clone();
         let prefix_url = self.prefix_url.clone();
+        let user_agent = self.user_agent.clone();
         
         tokio::spawn(async move {
             sleep(Duration::from_millis(next_ms)).await;
@@ -144,7 +154,7 @@ impl TokenManager {
                     "clusterId": cluster_id,
                     "token": current_token,
                 }))
-                .header("user-agent", format!("rust-openbmclapi-cluster/{}", version))
+                .header("user-agent", &user_agent)
                 .send()
                 .await {
                     Ok(resp) => resp,
@@ -181,6 +191,7 @@ impl TokenManager {
             let prefix_url_clone = prefix_url.clone();
             let version_clone = version.clone();
             let cluster_secret_clone = cluster_secret.clone();
+            let user_agent_clone = user_agent.clone();
             
             tokio::spawn(async move {
                 sleep(Duration::from_millis(next_ms)).await;
@@ -191,6 +202,7 @@ impl TokenManager {
                     token: token_clone,
                     client: client_clone,
                     prefix_url: prefix_url_clone,
+                    user_agent: user_agent_clone,
                 };
                 
                 if let Err(err) = token_manager.refresh_token().await {
@@ -213,7 +225,7 @@ impl TokenManager {
                 "clusterId": self.cluster_id,
                 "token": current_token,
             }))
-            .header("user-agent", format!("rust-openbmclapi-cluster/{}", self.version))
+            .header("user-agent", &self.user_agent)
             .send()
             .await?;
 

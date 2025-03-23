@@ -26,7 +26,7 @@ use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
 
 // 定义一个常量用于存储User-Agent信息
-const USER_AGENT: &str = "rust-openbmclapi-cluster";
+const USER_AGENT: &str = "openbmclapi-cluster/1.13.1 rust-openbmclapi-cluster";
 
 pub struct Cluster {
     client: Client,

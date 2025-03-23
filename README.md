@@ -134,7 +134,3 @@ Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过
 ## 许可证
 
 本项目采用AGPLv3许可证 - 详见LICENSE文件。
-
-## 致谢
-
-感谢原版OpenBMCLAPI项目(@bangbang93)以及BMCLAPI团队的支持

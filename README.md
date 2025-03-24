@@ -1,7 +1,4 @@
-# BMCLAPI
-
-> [!WARNING]
-> 本项目正在开发中，下载部分有实现问题，请不要使用！
+# Rust OpenBMCLAPI
 
 BMCLAPI是@bangbang93开发的BMCL的一部分，用于解决国内线路对Forge和Minecraft官方使用的Amazon S3速度缓慢的问题。BMCLAPI是对外开放的，所有需要Minecraft资源的启动器均可调用。
 

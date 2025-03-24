@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
+use log::{debug, warn};
 
 use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
@@ -50,6 +51,7 @@ impl AlistWebdavStorage {
             return Ok(());
         }
         
+        debug!("创建WebDAV目录: {}", path);
         // 如果目录不存在，则创建
         let res = self.client.request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), &url)
             .basic_auth(&self.username, Some(&self.password))
@@ -99,6 +101,7 @@ impl Storage for AlistWebdavStorage {
         }
         
         // 上传文件
+        debug!("上传文件到WebDAV: {}", path);
         let res = self.client.put(&file_url)
             .basic_auth(&self.username, Some(&self.password))
             .body(content)
@@ -146,29 +149,59 @@ impl Storage for AlistWebdavStorage {
     }
     
     async fn handle_bytes_request(&self, hash_path: &str, _req: Request<&[u8]>) -> Result<Response<Body>> {
-        // 对于WebDAV，我们需要先下载文件到临时目录，然后返回
+        // 使用重定向处理而不是先下载
         let file_url = format!("{}{}/{}", self.base_url, self.path, hash_path);
         
-        // 下载文件到临时目录
-        let res = self.client.get(&file_url)
+        // 先检查文件是否存在
+        let head_res = self.client.head(&file_url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await?;
             
-        if !res.status().is_success() {
+        if !head_res.status().is_success() {
+            debug!("文件在WebDAV中不存在: {}", hash_path);
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty())?);
         }
         
-        let bytes = res.bytes().await?;
+        // 使用reqwest检查重定向，但不下载整个文件
+        debug!("处理文件请求: {}", hash_path);
+        let response = self.client.get(&file_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await?;
         
-        // 返回响应
+        // 若返回重定向，则直接返回重定向响应
+        if response.status().is_redirection() {
+            if let Some(location) = response.headers().get(reqwest::header::LOCATION) {
+                // 将 reqwest 的 HeaderValue 转换为字符串
+                let location_str = location.to_str().unwrap_or_default();
+                debug!("重定向到: {}", location_str);
+                
+                if location_str.is_empty() {
+                    warn!("获取到空的重定向URL，使用原始URL");
+                    return Ok(Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("Location", file_url)
+                        .header("Cache-Control", "max-age=3600")
+                        .body(Body::empty())?);
+                }
+                
+                return Ok(Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("Location", location_str)
+                    .header("Cache-Control", "max-age=3600")
+                    .body(Body::empty())?);
+            }
+        }
+        
+        // 如果没有重定向，则返回一个重定向到原始URL的响应
+        debug!("直接重定向到文件URL: {}", file_url);
         Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", bytes.len())
-            .header("Cache-Control", "max-age=2592000")
-            .body(Body::from(bytes))?)
+            .status(StatusCode::FOUND)
+            .header("Location", file_url)
+            .header("Cache-Control", "max-age=3600")
+            .body(Body::empty())?)
     }
 } 

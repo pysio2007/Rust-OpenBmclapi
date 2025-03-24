@@ -1230,7 +1230,7 @@ impl Cluster {
                 cursor.set_position(start_pos + 1);
             }
             
-            if files.len() > 500000 {
+            if files.len() > 5000000 {
                 break;
             }
         }
@@ -1257,7 +1257,7 @@ impl Cluster {
         let start_pos = cursor.position();
         
         let array_size = match Self::read_avro_zigzag_long(cursor) {
-            Ok(size) if size > 0 && size < 500000 => size as usize,
+            Ok(size) if size > 0 && size < 5000000 => size as usize,
             _ => {
                 cursor.set_position(start_pos);
                 return Err(anyhow!("无效的Avro数组大小"));
@@ -1644,7 +1644,18 @@ impl Cluster {
                                         let hash_hex = hasher.finalize();
                                         let calculated_hash = format!("{:x}", hash_hex);
                                         
-                                        if calculated_hash.to_lowercase() != file_info.hash.to_lowercase() {
+                                        // 读取文件内容进行验证，确保能够正确处理不同哈希算法
+                                        let content = match tokio::fs::read(&temp_path).await {
+                                            Ok(data) => data,
+                                            Err(e) => {
+                                                error!("读取临时文件失败: {}", e);
+                                                let _ = tokio::fs::remove_file(&temp_path).await;
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        // 使用统一的验证函数进行校验
+                                        if !validate_file(&content, &file_info.hash) {
                                             error!("文件校验失败: 期望={}, 实际={}", file_info.hash, calculated_hash);
                                             let _ = tokio::fs::remove_file(&temp_path).await;
                                             continue;
@@ -1766,7 +1777,18 @@ impl Cluster {
                                                             let hash_hex = hasher.finalize();
                                                             let calculated_hash = format!("{:x}", hash_hex);
                                                             
-                                                            if calculated_hash.to_lowercase() != file_info.hash.to_lowercase() {
+                                                            // 读取文件内容进行验证，确保能够正确处理不同哈希算法
+                                                            let content = match tokio::fs::read(&temp_path).await {
+                                                                Ok(data) => data,
+                                                                Err(e) => {
+                                                                    error!("读取临时文件失败: {}", e);
+                                                                    let _ = tokio::fs::remove_file(&temp_path).await;
+                                                                    continue;
+                                                                }
+                                                            };
+                                                            
+                                                            // 使用统一的验证函数进行校验
+                                                            if !validate_file(&content, &file_info.hash) {
                                                                 error!("文件校验失败: 期望={}, 实际={}", file_info.hash, calculated_hash);
                                                                 let _ = tokio::fs::remove_file(&temp_path).await;
                                                                 continue;
@@ -2397,6 +2419,22 @@ async fn serve_file(
     }
 }
 
+/**
+ * 验证文件内容与给定的哈希值是否匹配
+ * 
+ * 支持以下哈希算法：
+ * - MD5 (32位十六进制字符串)
+ * - SHA1 (40位十六进制字符串)
+ * - 其他长度的哈希值会尝试用MD5和SHA1两种算法进行验证
+ * 
+ * # 参数
+ * - `data`: 文件数据
+ * - `hash`: 期望的哈希值，大小写不敏感
+ * 
+ * # 返回值
+ * - `true`: 哈希值匹配
+ * - `false`: 哈希值不匹配
+ */
 pub fn validate_file(data: &[u8], hash: &str) -> bool {
     let expected = hash.to_lowercase().trim().to_string();
     
@@ -2407,11 +2445,12 @@ pub fn validate_file(data: &[u8], hash: &str) -> bool {
         let actual = format!("{:x}", digest).to_lowercase();
         
         if expected != actual {
+            log::error!("MD5哈希校验失败: 期望={}, 实际={}", expected, actual);
             log::debug!("MD5哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
         }
         
         actual == expected
-    } else {
+    } else if expected.len() == 40 {
         // SHA1哈希 (40位)
         use sha1::{Sha1, Digest};
         let mut hasher = Sha1::new();
@@ -2419,10 +2458,35 @@ pub fn validate_file(data: &[u8], hash: &str) -> bool {
         let actual = format!("{:x}", hasher.finalize()).to_lowercase();
         
         if expected != actual {
+            log::error!("SHA1哈希校验失败: 期望={}, 实际={}", expected, actual);
             log::debug!("SHA1哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
         }
         
         actual == expected
+    } else {
+        // 未知长度的哈希值，尝试两种算法
+        // 先尝试MD5
+        let md5_digest = md5::compute(data);
+        let md5_actual = format!("{:x}", md5_digest).to_lowercase();
+        
+        if expected == md5_actual {
+            return true;
+        }
+        
+        // 再尝试SHA1
+        use sha1::{Sha1, Digest};
+        let mut hasher = Sha1::new();
+        hasher.update(data);
+        let sha1_actual = format!("{:x}", hasher.finalize()).to_lowercase();
+        
+        if expected == sha1_actual {
+            return true;
+        }
+        
+        // 都不匹配，记录错误并返回失败
+        log::error!("未知长度哈希校验失败: 期望={}, MD5={}, SHA1={}", expected, md5_actual, sha1_actual);
+        log::warn!("未知哈希算法: 哈希长度 {}", expected.len());
+        false
     }
 }
 

@@ -1228,7 +1228,7 @@ impl Cluster {
                 cursor.set_position(start_pos + 1);
             }
             
-            if files.len() > 100000 {
+            if files.len() > 500000 {
                 break;
             }
         }

@@ -43,7 +43,7 @@ jobs:
     - name: 缓存 Rust 依赖
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ matrix.target }}
+        key: ${{ matrix.os }}-${{ matrix.target }}
 
     - name: 构建
       uses: actions-rs/cargo@v1

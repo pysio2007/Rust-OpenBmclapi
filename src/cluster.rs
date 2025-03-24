@@ -1458,13 +1458,13 @@ impl Cluster {
         // 使用全局共享的MULTI_PROGRESS实例
         let multi_progress = crate::logger::MULTI_PROGRESS.clone();
         
-        // 创建总进度条
+        // 创建总进度条，放在底部
         let total_progress = multi_progress.add(indicatif::ProgressBar::new(total_bytes));
         total_progress.set_style(indicatif::ProgressStyle::default_bar()
             .template("[总进度] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
             .unwrap()
             .progress_chars("=>-"));
-            
+        
         // 设置进度条无阻塞绘制，防止被日志顶掉
         total_progress.enable_steady_tick(std::time::Duration::from_millis(100));
             
@@ -1472,209 +1472,328 @@ impl Cluster {
         
         use futures::stream::{self, StreamExt};
         
-        let results = stream::iter(missing_files)
-            .map(|file| {
-                let client = self.client.clone();
-                let token = token.clone();
-                let storage = self.storage.clone();
-                let _source = source.clone();
-                let _base_url = self.base_url.clone();
-                let multi_progress = multi_progress.clone();
-                let total_progress = total_progress.clone();
-                let cache_dir = self.cache_dir.clone();
-                
-                async move {
-                    // 为每个文件创建单独的进度条
-                    let file_progress = multi_progress.add(indicatif::ProgressBar::new(file.size));
-                    file_progress.set_style(indicatif::ProgressStyle::default_bar()
-                        .template("[{filename}] [{bar:40.green/red}] {bytes}/{total_bytes}")
-                        .unwrap()
-                        .progress_chars("=>-"));
+        // 跟踪已完成的文件路径
+        let mut completed_paths = Vec::new();
+        // 跟踪当前要下载的文件
+        let mut current_files = missing_files;
+        
+        // 循环直到所有文件都下载完成
+        while !current_files.is_empty() {
+            info!("开始下载批次，共{}个文件", current_files.len());
+            
+            // 保存成功和失败的文件
+            let mut successful_files = Vec::new();
+            let mut failed_files = Vec::new();
+            
+            // 使用future流同时下载多个文件
+            let download_files = current_files.clone();
+            let mut download_stream = stream::iter(download_files.iter().cloned())
+                .map(|file| {
+                    let client = self.client.clone();
+                    let token = token.clone();
+                    let storage = self.storage.clone();
+                    let _source = source.clone();
+                    let _base_url = self.base_url.clone();
+                    let multi_progress = multi_progress.clone();
+                    let total_progress = total_progress.clone();
+                    let cache_dir = self.cache_dir.clone();
                     
-                    // 启用稳定的后台刷新，减少被日志覆盖的可能性
-                    file_progress.enable_steady_tick(std::time::Duration::from_millis(100));
-                    
-                    let filename = file.path.split('/').last().unwrap_or(&file.path);
-                    file_progress.set_message(filename.to_string());
-                    
-                    // 用debug级别记录开始下载信息，避免过多info日志干扰进度条
-                    debug!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
-                    
-                    for retry in 0..10 {
-                        if retry > 0 {
-                            debug!("重试下载文件 {} (第{}次)", file.path, retry);
-                        }
+                    async move {
+                        // 为每个文件创建单独的进度条，放置在总进度条之上
+                        let file_progress = multi_progress.insert_before(&*total_progress, 
+                            indicatif::ProgressBar::new(file.size));
+                        file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                            .template("[{msg}] [{bar:40.green/red}] {bytes}/{total_bytes}")
+                            .unwrap()
+                            .progress_chars("=>-"));
                         
-                        let path = if file.path.starts_with('/') {
-                            file.path[1..].to_string()
-                        } else {
+                        // 启用稳定的后台刷新，减少被日志覆盖的可能性
+                        file_progress.enable_steady_tick(std::time::Duration::from_millis(100));
+                        
+                        // 初始显示的文件名为路径最后一部分，处理更多特殊情况
+                        let original_filename = {
+                            // 首先尝试从路径中提取文件名
+                            let path_filename = file.path.split(|c| c == '/' || c == '\\').last().unwrap_or(&file.path);
+                            
+                            // 检查是否是纯哈希值（通常为32位MD5或40位SHA1）
+                            if (path_filename.len() == 32 || path_filename.len() == 40) && 
+                               path_filename.chars().all(|c| c.is_ascii_hexdigit()) {
+                                
+                                // 尝试从原始URL路径中提取更好的文件名
+                                match file.path.split(|c| c == '/' || c == '\\')
+                                          .filter(|&part| !part.is_empty() && 
+                                                 (part.len() != 32 && part.len() != 40 || 
+                                                  !part.chars().all(|c| c.is_ascii_hexdigit())))
+                                          .last() {
+                                    Some(better_name) => better_name,
+                                    None => path_filename, 
+                                }
+                            } else {
+                                path_filename
+                            }
+                        };
+                        
+                        // 确保文件名不为空
+                        let original_filename = if original_filename.is_empty() {
                             file.path.clone()
-                        };
-                        
-                        let openbmclapi_url = &_base_url;
-                        
-                        let url = if openbmclapi_url.ends_with('/') {
-                            format!("{}{}", openbmclapi_url, path)
                         } else {
-                            format!("{}/{}", openbmclapi_url, path)
+                            original_filename.to_string()
                         };
                         
-                        debug!("获取文件重定向URL: {}", url);
+                        file_progress.set_message(original_filename.clone());
                         
-                        match client.get(&url)
-                            .header("Authorization", format!("Bearer {}", token))
-                            .send()
-                            .await {
-                            Ok(response) => {
-                                if response.status().is_success() {
-                                    match response.bytes().await {
-                                        Ok(bytes) => {
-                                            debug!("文件 {} 下载完成，大小: {} 字节", file.path, bytes.len());
-                                            
-                                            let is_file_correct = validate_file(&bytes, &file.hash);
-                                            if !is_file_correct {
-                                                error!("文件{}校验失败", file.path);
-                                                continue;
-                                            }
-                                            
-                                            // 确保目录存在
-                                            let hash_path = cache_dir.join(hash_to_filename(&file.hash));
-                                            if let Some(parent) = hash_path.parent() {
-                                                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                                                    error!("创建目录失败 {}: {}", parent.display(), e);
+                        // 用debug级别记录开始下载信息，避免过多info日志干扰进度条
+                        debug!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
+                        
+                        // 初始化下载URL和来源标志，在后续使用中再赋值
+                        let mut download_url;
+                        let mut is_direct_download;
+                        
+                        for retry in 0..10 {
+                            if retry > 0 {
+                                debug!("重试下载文件 {} (第{}次)", file.path, retry);
+                            }
+                            
+                            let path = if file.path.starts_with('/') {
+                                file.path[1..].to_string()
+                            } else {
+                                file.path.clone()
+                            };
+                            
+                            let openbmclapi_url = &_base_url;
+                            
+                            let url = if openbmclapi_url.ends_with('/') {
+                                format!("{}{}", openbmclapi_url, path)
+                            } else {
+                                format!("{}/{}", openbmclapi_url, path)
+                            };
+                            
+                            debug!("获取文件重定向URL: {}", url);
+                            
+                            // 缓存主控URL，用于后续判断是否是直接从主控下载
+                            download_url = url.clone();
+                            
+                            match client.get(&url)
+                                .header("Authorization", format!("Bearer {}", token))
+                                .send()
+                                .await {
+                                Ok(response) => {
+                                    if response.status().is_success() {
+                                        // 记录是直接从主控下载，没有重定向
+                                        is_direct_download = true;
+                                        
+                                        match response.bytes().await {
+                                            Ok(bytes) => {
+                                                debug!("文件 {} 下载完成，大小: {} 字节", file.path, bytes.len());
+                                                
+                                                let is_file_correct = validate_file(&bytes, &file.hash);
+                                                if !is_file_correct {
+                                                    error!("文件{}校验失败", file.path);
                                                     continue;
                                                 }
-                                            }
-                                            
-                                            if let Err(e) = storage.write_file(hash_path.to_str().unwrap().to_string(), bytes.to_vec(), &file).await {
-                                                error!("保存文件 {} 失败: {}", file.path, e);
-                                                continue;
-                                            }
-                                            
-                                            file_progress.finish_with_message(format!("{} - 完成", filename));
-                                            file_progress.set_style(indicatif::ProgressStyle::default_bar()
-                                                .template("[{filename}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
-                                                .unwrap()
-                                                .progress_chars("=>-"));
-                                            
-                                            total_progress.inc(file.size);
-                                            debug!("文件 {} 同步成功", file.path);
-                                            return Ok(file.path.clone());
-                                        }
-                                        Err(e) => {
-                                            debug!("读取文件 {} 响应体失败: {}", file.path, e);
-                                        }
-                                    }
-                                } else if response.status().is_redirection() {
-                                    if let Some(location) = response.headers().get("location") {
-                                        if let Ok(redirect_url) = location.to_str() {
-                                            debug!("文件 {} 获取到重定向URL: {}", file.path, redirect_url);
-                                            
-                                            match client.get(redirect_url)
-                                                .send()
-                                                .await {
-                                                Ok(redirect_response) => {
-                                                    if redirect_response.status().is_success() {
-                                                        match redirect_response.bytes().await {
-                                                            Ok(bytes) => {
-                                                                debug!("文件 {} 从重定向URL下载完成，大小: {} 字节", file.path, bytes.len());
-                                                                
-                                                                let is_file_correct = validate_file(&bytes, &file.hash);
-                                                                if !is_file_correct {
-                                                                    error!("文件{}校验失败", file.path);
-                                                                    continue;
-                                                                }
-                                                                
-                                                                // 确保目录存在
-                                                                let hash_path = cache_dir.join(hash_to_filename(&file.hash));
-                                                                if let Some(parent) = hash_path.parent() {
-                                                                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                                                                        error!("创建目录失败 {}: {}", parent.display(), e);
-                                                                        continue;
-                                                                    }
-                                                                }
-                                                                
-                                                                if let Err(e) = storage.write_file(hash_path.to_str().unwrap().to_string(), bytes.to_vec(), &file).await {
-                                                                    error!("保存文件 {} 失败: {}", file.path, e);
-                                                                    continue;
-                                                                }
-                                                                
-                                                                file_progress.finish_with_message(format!("{} - 完成", filename));
-                                                                file_progress.set_style(indicatif::ProgressStyle::default_bar()
-                                                                    .template("[{filename}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
-                                                                    .unwrap()
-                                                                    .progress_chars("=>-"));
-                                                                
-                                                                total_progress.inc(file.size);
-                                                                debug!("文件 {} 同步成功", file.path);
-                                                                return Ok(file.path.clone());
-                                                            }
-                                                            Err(e) => {
-                                                                debug!("读取重定向文件 {} 响应体失败: {}", file.path, e);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        debug!("从重定向URL下载文件 {} 失败: HTTP {}", file.path, redirect_response.status());
+                                                
+                                                // 确保目录存在
+                                                let hash_path = hash_to_filename(&file.hash);
+                                                let full_path = cache_dir.join(&hash_path);
+                                                if let Some(parent) = full_path.parent() {
+                                                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                                        error!("创建目录失败 {}: {}", parent.display(), e);
+                                                        continue;
                                                     }
                                                 }
-                                                Err(e) => {
-                                                    debug!("请求重定向URL {} 失败: {}", redirect_url, e);
+                                                
+                                                if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                                    error!("保存文件 {} 失败: {}", file.path, e);
+                                                    continue;
                                                 }
+                                                
+                                                // 按照规则显示文件名：直接从主控下载，显示主控地址
+                                                let display_name = if is_direct_download {
+                                                    // 从URL中提取主机部分作为显示
+                                                    if let Ok(parsed_url) = url::Url::parse(&download_url) {
+                                                        format!("{} (via {})", original_filename, parsed_url.host_str().unwrap_or("主控"))
+                                                    } else {
+                                                        format!("{} (via 主控)", original_filename)
+                                                    }
+                                                } else {
+                                                    original_filename.to_string()
+                                                };
+                                                
+                                                file_progress.finish_with_message(format!("{} - 完成", display_name));
+                                                file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                                                    .template("[{msg}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
+                                                    .unwrap()
+                                                    .progress_chars("=>-"));
+                                                
+                                                // 完成后移动到顶部：先从当前位置移除，然后插入到顶部
+                                                let pb_clone = file_progress.clone();
+                                                multi_progress.remove(&pb_clone);
+                                                multi_progress.insert(0, pb_clone);
+                                                
+                                                total_progress.inc(file.size);
+                                                debug!("文件 {} 同步成功", file.path);
+                                                return (true, file);
+                                            }
+                                            Err(e) => {
+                                                debug!("读取文件 {} 响应体失败: {}", file.path, e);
+                                            }
+                                        }
+                                    } else if response.status().is_redirection() {
+                                        if let Some(location) = response.headers().get("location") {
+                                            if let Ok(location_url) = location.to_str() {
+                                                debug!("文件 {} 获取到重定向URL: {}", file.path, location_url);
+                                                
+                                                // 记录最终的重定向URL，用于显示
+                                                download_url = location_url.to_string();
+                                                is_direct_download = false;
+                                                
+                                                match client.get(location_url)
+                                                    .send()
+                                                    .await {
+                                                    Ok(redirect_response) => {
+                                                        if redirect_response.status().is_success() {
+                                                            match redirect_response.bytes().await {
+                                                                Ok(bytes) => {
+                                                                    debug!("文件 {} 从重定向URL下载完成，大小: {} 字节", file.path, bytes.len());
+                                                                    
+                                                                    let is_file_correct = validate_file(&bytes, &file.hash);
+                                                                    if !is_file_correct {
+                                                                        error!("文件{}校验失败", file.path);
+                                                                        continue;
+                                                                    }
+                                                                    
+                                                                    // 确保目录存在
+                                                                    let hash_path = hash_to_filename(&file.hash);
+                                                                    let full_path = cache_dir.join(&hash_path);
+                                                                    if let Some(parent) = full_path.parent() {
+                                                                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                                                            error!("创建目录失败 {}: {}", parent.display(), e);
+                                                                            continue;
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    if let Err(e) = storage.write_file(hash_path, bytes.to_vec(), &file).await {
+                                                                        error!("保存文件 {} 失败: {}", file.path, e);
+                                                                        continue;
+                                                                    }
+                                                                    
+                                                                    // 按照规则显示文件名：来自重定向，显示上一部分
+                                                                    let display_name = if !is_direct_download {
+                                                                        // 从URL中提取主机部分作为显示
+                                                                        if let Ok(parsed_url) = url::Url::parse(&download_url) {
+                                                                            let host = parsed_url.host_str().unwrap_or("unknown");
+                                                                            format!("{} (via {})", original_filename, host)
+                                                                        } else {
+                                                                            original_filename.to_string()
+                                                                        }
+                                                                    } else {
+                                                                        original_filename.to_string()
+                                                                    };
+                                                                    
+                                                                    file_progress.finish_with_message(format!("{} - 完成", display_name));
+                                                                    file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                                                                        .template("[{msg}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
+                                                                        .unwrap()
+                                                                        .progress_chars("=>-"));
+                                                                    
+                                                                    // 完成后移动到顶部：先从当前位置移除，然后插入到顶部
+                                                                    let pb_clone = file_progress.clone();
+                                                                    multi_progress.remove(&pb_clone);
+                                                                    multi_progress.insert(0, pb_clone);
+                                                                    
+                                                                    total_progress.inc(file.size);
+                                                                    debug!("文件 {} 同步成功", file.path);
+                                                                    return (true, file);
+                                                                }
+                                                                Err(e) => {
+                                                                    debug!("读取重定向文件 {} 响应体失败: {}", file.path, e);
+                                                                }
+                                                            }
+                                                        } else {
+                                                            info!("从重定向URL下载文件 {} 失败: HTTP {}", file.path, redirect_response.status());
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        debug!("请求重定向URL {} 失败: {}", download_url, e);
+                                                    }
+                                                }
+                                            } else {
+                                                debug!("解析重定向URL失败");
                                             }
                                         } else {
-                                            debug!("解析重定向URL失败");
+                                            debug!("重定向响应没有location头");
                                         }
                                     } else {
-                                        debug!("重定向响应没有location头");
+                                        info!("下载文件 {} 失败: HTTP {}", file.path, response.status());
                                     }
-                                } else {
-                                    debug!("下载文件 {} 失败: HTTP {}", file.path, response.status());
+                                }
+                                Err(e) => {
+                                    info!("下载文件 {} 失败，正在重试: {}", file.path, e);
                                 }
                             }
-                            Err(e) => {
-                                debug!("下载文件 {} 失败，正在重试: {}", file.path, e);
+                            
+                            if retry < 9 {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
                             }
                         }
                         
-                        if retry < 9 {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        }
+                        // 显示失败状态，但记录用于后续重试
+                        file_progress.finish_with_message(format!("{} - 失败，将在1分钟后重试", original_filename));
+                        file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                            .template("[{msg}] [{bar:40.red/red}] {bytes}/{total_bytes} ⟳")
+                            .unwrap()
+                            .progress_chars("=>-"));
+                        
+                        // 失败的任务也移动到顶部，但在成功任务之后
+                        let pb_clone = file_progress.clone();
+                        multi_progress.remove(&pb_clone);
+                        multi_progress.insert(0, pb_clone);
+                        
+                        // 使用error级别记录失败，确保在日志中明显显示
+                        error!("下载文件失败: {} - 已重试多次，添加到1分钟后重试队列", file.path);
+                        return (false, file);
                     }
-                    
-                    file_progress.finish_with_message(format!("{} - 失败", filename));
-                    file_progress.set_style(indicatif::ProgressStyle::default_bar()
-                        .template("[{filename}] [{bar:40.red/red}] {bytes}/{total_bytes} ✗")
-                        .unwrap()
-                        .progress_chars("=>-"));
-                    
-                    error!("下载文件 {} 失败，已重试多次", file.path);
-                    Err(anyhow!("下载文件 {} 失败", file.path))
+                })
+                .buffer_unordered(parallel);
+                
+            // 同时处理下载结果，区分成功和失败
+            while let Some((is_success, file)) = download_stream.next().await {
+                if is_success {
+                    // 成功下载
+                    successful_files.push(file.path.clone());
+                    success_count += 1;
+                } else {
+                    // 下载失败，稍后重试，先记录日志
+                    error!("文件下载失败: {} - 将在1分钟后重试", file.path);
+                    failed_files.push(file);
                 }
-            })
-            .buffer_unordered(parallel)
-            .collect::<Vec<Result<String>>>()
-            .await;
+            }
+            
+            // 记录已完成的路径
+            completed_paths.extend(successful_files);
+            
+            // 更新剩余需要下载的文件
+            current_files = failed_files;
+            
+            // 如果还有失败的文件，等待1分钟后重试
+            if !current_files.is_empty() {
+                info!("有 {} 个文件下载失败，将在1分钟后重试", current_files.len());
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
         
+        // 完成后总进度条也更新样式
         total_progress.finish_with_message("下载完成");
         total_progress.set_style(indicatif::ProgressStyle::default_bar()
             .template("[总进度] [{bar:40.bright_green/blue}] {bytes}/{total_bytes} ✓")
             .unwrap()
             .progress_chars("=>-"));
         
-        let mut has_error = false;
-        for result in &results {
-            if result.is_ok() {
-                success_count += 1;
-            } else {
-                has_error = true;
-            }
-        }
-        
         info!("完成 {}/{} 文件", success_count, total_count);
         
-        if has_error {
-            error!("同步失败");
-            Err(anyhow!("同步失败"))
+        if success_count < total_count {
+            error!("同步失败，部分文件未能成功下载");
+            Err(anyhow!("同步失败，只有{}个文件下载成功，总共{}个文件", success_count, total_count))
         } else {
             info!("同步完成");
             Ok(())

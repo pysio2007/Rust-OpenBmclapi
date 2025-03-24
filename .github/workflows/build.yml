@@ -15,12 +15,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-20.04, windows-latest]
+        os: [ubuntu-latest, ubuntu-20.04, ubuntu-22.04, windows-latest]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: rust-bmclapi
           - os: ubuntu-20.04
+            target: x86_64-unknown-linux-gnu
+            executable: rust-bmclapi
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             executable: rust-bmclapi
           - os: windows-latest
@@ -57,8 +60,14 @@ jobs:
         mkdir -p artifacts
         cp target/${{ matrix.target }}/release/${{ matrix.executable }} artifacts/
 
-    - name: 重命名 Linux 产物 (OLD GLIBC)
+    - name: 重命名 Linux 产物 (Ubuntu 20.04)
       if: matrix.os == 'ubuntu-20.04'
+      run: |
+        mkdir -p artifacts
+        cp target/${{ matrix.target }}/release/${{ matrix.executable }} artifacts/
+
+    - name: 重命名 Linux 产物 (Ubuntu 22.04)
+      if: matrix.os == 'ubuntu-22.04'
       run: |
         mkdir -p artifacts
         cp target/${{ matrix.target }}/release/${{ matrix.executable }} artifacts/
@@ -72,6 +81,6 @@ jobs:
     - name: 上传构建产物
       uses: actions/upload-artifact@v4
       with:
-        name: rust-bmclapi-${{ matrix.os }}${{ matrix.os == 'ubuntu-20.04' && '-old' || '' }}
+        name: rust-bmclapi-${{ matrix.os }}
         path: artifacts/${{ matrix.executable }}
         retention-days: 5 

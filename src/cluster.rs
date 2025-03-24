@@ -1255,7 +1255,7 @@ impl Cluster {
         let start_pos = cursor.position();
         
         let array_size = match Self::read_avro_zigzag_long(cursor) {
-            Ok(size) if size > 0 && size < 100000 => size as usize,
+            Ok(size) if size > 0 && size < 500000 => size as usize,
             _ => {
                 cursor.set_position(start_pos);
                 return Err(anyhow!("无效的Avro数组大小"));

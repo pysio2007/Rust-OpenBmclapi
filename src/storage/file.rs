@@ -22,15 +22,28 @@ const RETRY_DELAY: u64 = 5;
 
 pub struct FileStorage {
     cache_dir: PathBuf,
+    verified_hashes: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl FileStorage {
     pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir }
+        Self { 
+            cache_dir,
+            verified_hashes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        }
     }
     
     async fn verify_file(&self, path: &str, expected_hash: &str) -> Result<bool> {
         let file_path = self.cache_dir.join(path);
+        
+        // 检查是否已验证过
+        {
+            let verified = self.verified_hashes.lock().await;
+            if verified.contains(expected_hash) {
+                return Ok(true);
+            }
+        }
+        
         debug!("验证文件: {}, 预期哈希: {}", file_path.display(), expected_hash);
         
         // 读取文件内容
@@ -49,6 +62,9 @@ impl FileStorage {
             warn!("文件哈希验证失败: {}", file_path.display());
         } else {
             debug!("文件哈希验证成功: {}", file_path.display());
+            // 添加到已验证集合
+            let mut verified = self.verified_hashes.lock().await;
+            verified.insert(expected_hash.to_string());
         }
         
         Ok(is_valid)
@@ -141,123 +157,196 @@ impl Storage for FileStorage {
     }
     
     async fn get_missing_files(&self, files: &[FileInfo]) -> Result<Vec<FileInfo>> {
-        let mut missing_files = Vec::new();
         let total_files = files.len();
+        info!("开始检查 {} 个文件", total_files);
         
-        // 创建一个Arc引用以便在多个任务间共享
-        let self_arc = Arc::new(self.clone());
+        // 首先预扫描并建立索引，避免逐个查询文件系统
+        info!("预扫描缓存目录，建立索引...");
+        let mut _file_index: std::collections::HashMap<String, std::path::PathBuf> = std::collections::HashMap::new();
+        let mut _size_index: std::collections::HashMap<std::path::PathBuf, u64> = std::collections::HashMap::new();
         
-        // 使用信号量限制并发数量为32
-        let semaphore = Arc::new(Semaphore::new(32));
+        // 使用多线程IO扫描文件系统
+        let scan_start = std::time::Instant::now();
+        let cache_dir = self.cache_dir.clone();
         
-        // 使用一个计数器跟踪进度
-        let checked_count = Arc::new(tokio::sync::Mutex::new(0));
+        // 使用多线程扫描方式
+        let file_index_result = tokio::task::spawn_blocking(move || {
+            let mut file_index: std::collections::HashMap<String, std::path::PathBuf> = std::collections::HashMap::new();
+            let mut size_index: std::collections::HashMap<std::path::PathBuf, u64> = std::collections::HashMap::new();
+            
+            fn scan_dir(dir: &std::path::Path, file_index: &mut std::collections::HashMap<String, std::path::PathBuf>, 
+                       size_index: &mut std::collections::HashMap<std::path::PathBuf, u64>) -> Result<()> {
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    
+                    if path.is_dir() {
+                        scan_dir(&path, file_index, size_index)?;
+                    } else if let Some(file_name) = path.file_name() {
+                        if let Some(file_name_str) = file_name.to_str() {
+                            file_index.insert(file_name_str.to_lowercase(), path.clone());
+                            
+                            // 同时缓存文件大小信息
+                            if let Ok(metadata) = std::fs::metadata(&path) {
+                                size_index.insert(path, metadata.len());
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            
+            // 确保目录存在
+            if !cache_dir.exists() {
+                let _ = std::fs::create_dir_all(&cache_dir);
+                return (file_index, size_index);
+            }
+            
+            if let Err(e) = scan_dir(&cache_dir, &mut file_index, &mut size_index) {
+                eprintln!("扫描目录时出错: {}", e);
+            }
+            
+            (file_index, size_index)
+        }).await.unwrap();
         
-        // 将files切片转换为包含所有权的Vec
-        let files_vec: Vec<FileInfo> = files.to_vec();
-
+        let (file_index, size_index) = file_index_result;
+        let scan_duration = scan_start.elapsed();
+        info!("目录扫描完成，耗时 {:.2}s，索引 {} 个文件", 
+              scan_duration.as_secs_f64(), file_index.len());
+        
         // 获取当前时间戳，用于决定是否进行随机抽检
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         
-        // 抽检比例，默认为5%的文件会被完整校验
-        let verification_ratio = 0.05;
+        // 减少抽检比例，提高性能
+        let verification_ratio = 0.005; // 只对0.5%的文件进行完整校验
         
-        // 创建一个流处理文件检查
-        let results = stream::iter(files_vec)
-            .map(|file| {
-                let self_clone = self_arc.clone();
-                let sem_clone = semaphore.clone();
-                let counter_clone = checked_count.clone();
-                
-                async move {
-                    // 获取信号量许可，限制并发数量
-                    let _permit = sem_clone.acquire().await.unwrap();
+        // 分批处理文件检查，每批8000个文件
+        let batch_size = 8000;
+        let mut missing_files = Vec::new();
+        
+        for (batch_index, file_batch) in files.chunks(batch_size).enumerate() {
+            let batch_start = std::time::Instant::now();
+            info!("处理批次 {}/{} (每批 {} 个文件)...", 
+                 batch_index + 1, (total_files + batch_size - 1) / batch_size, batch_size);
+            
+            // 创建一个Arc引用以便在多个任务间共享
+            let self_arc = Arc::new(self.clone());
+            let file_index = Arc::new(file_index.clone());
+            let size_index = Arc::new(size_index.clone());
+            
+            // 使用200个并发任务进行检查
+            let semaphore = Arc::new(Semaphore::new(200));
+            
+            // 使用一个计数器跟踪进度
+            let checked_count = Arc::new(tokio::sync::Mutex::new(0));
+            let batch_size = file_batch.len();
+            
+            // 准备批次的文件
+            let files_vec: Vec<FileInfo> = file_batch.to_vec();
+            
+            // 并发处理此批次
+            let results = stream::iter(files_vec)
+                .map(|file| {
+                    let self_clone = self_arc.clone();
+                    let sem_clone = semaphore.clone();
+                    let counter_clone = checked_count.clone();
+                    let file_index = file_index.clone();
+                    let size_index = size_index.clone();
                     
-                    let hash_path = hash_to_filename(&file.hash);
-                    let file_path = self_clone.cache_dir.join(&hash_path);
-                    
-                    // 更新计数器并记录进度
-                    {
-                        let mut count = counter_clone.lock().await;
-                        *count += 1;
-                        if *count % 100 == 0 {
-                            debug!("已检查 {}/{} 个文件", *count, total_files);
+                    async move {
+                        // 获取信号量许可，限制并发数量
+                        let _permit = sem_clone.acquire().await.unwrap();
+                        
+                        let hash = file.hash.to_lowercase();
+                        let hash_path = hash_to_filename(&hash);
+                        
+                        // 更新计数器并记录进度
+                        {
+                            let mut count = counter_clone.lock().await;
+                            *count += 1;
+                            if *count % 1000 == 0 {
+                                debug!("批次进度: {}/{}", *count, batch_size);
+                            }
                         }
-                    }
-                    
-                    // 首先检查文件是否存在
-                    if !file_path.exists() {
-                        debug!("文件不存在: {}", file_path.display());
-                        return (file, true); // 表示文件缺失
-                    }
-                    
-                    // 检查文件大小
-                    match fs::metadata(&file_path).await {
-                        Ok(metadata) => {
-                            if metadata.len() != file.size {
+                        
+                        // 使用索引快速检查文件是否存在
+                        let file_parts: Vec<&str> = hash_path.split('/').collect();
+                        let file_name = if file_parts.len() > 1 { file_parts[1] } else { &hash };
+                        
+                        if !file_index.contains_key(file_name) {
+                            return (file, true); // 文件缺失
+                        }
+                        
+                        // 获取文件路径
+                        let file_path = match file_index.get(file_name) {
+                            Some(path) => path,
+                            None => return (file, true), // 不应该发生，但为了安全考虑
+                        };
+                        
+                        // 使用索引快速检查文件大小
+                        if let Some(size) = size_index.get(file_path) {
+                            if *size != file.size {
                                 debug!("文件大小不匹配: {} (期望: {}, 实际: {})", 
-                                    file.path, file.size, metadata.len());
-                                return (file, true); // 表示文件缺失或损坏
+                                      file.path, file.size, size);
+                                return (file, true); // 文件大小不符
                             }
-                        },
-                        Err(e) => {
-                            error!("获取文件元数据失败: {} - {}", file_path.display(), e);
-                            return (file, true); // 表示文件缺失或损坏
-                        }
-                    }
-                    
-                    // 随机抽检：使用文件hash与时间戳组合计算，决定是否进行完整的SHA1校验
-                    // 注意：文件名本身就是SHA1，所以默认我们认为文件名正确则文件正确
-                    // 但为了安全起见，我们会对一部分文件进行完整的内容校验
-                    let should_verify = {
-                        // 使用文件hash的第一个字节和时间戳计算随机值
-                        let first_byte = u8::from_str_radix(&file.hash[0..2], 16).unwrap_or(0);
-                        let random_value = (first_byte as f64 / 255.0 + (timestamp % 100) as f64 / 100.0) % 1.0;
-                        random_value < verification_ratio
-                    };
-                    
-                    if should_verify {
-                        // 对随机选中的文件进行完整的哈希验证
-                        debug!("对文件进行随机抽检: {}", file.path);
-                        match self_clone.verify_file(&hash_path, &file.hash).await {
-                            Ok(true) => {
-                                debug!("文件验证成功: {}", file.path);
-                                (file, false) // 表示文件完好
-                            },
-                            Ok(false) => {
-                                warn!("文件验证失败: {} (哈希值不匹配)", file.path);
-                                (file, true) // 表示文件缺失或损坏
-                            },
-                            Err(e) => {
-                                error!("文件验证出错: {} - {}", file.path, e);
-                                (file, true) // 表示文件缺失或损坏
+                        } else {
+                            // 如果没有在索引中找到大小，则回退到传统检查
+                            match tokio::fs::metadata(file_path).await {
+                                Ok(metadata) => {
+                                    if metadata.len() != file.size {
+                                        debug!("文件大小不匹配: {} (期望: {}, 实际: {})", 
+                                              file.path, file.size, metadata.len());
+                                        return (file, true);
+                                    }
+                                },
+                                Err(_) => return (file, true),
                             }
                         }
-                    } else {
-                        // 对其他文件只验证文件名和大小
-                        debug!("文件名和大小验证通过: {}", file.path);
-                        (file, false) // 表示文件完好
+                        
+                        // 随机抽检
+                        let should_verify = {
+                            let first_byte = u8::from_str_radix(&hash[0..2], 16).unwrap_or(0);
+                            let random_value = (first_byte as f64 / 255.0 + (timestamp % 100) as f64 / 100.0) % 1.0;
+                            random_value < verification_ratio
+                        };
+                        
+                        if should_verify {
+                            debug!("对文件进行随机抽检: {}", file.path);
+                            match self_clone.verify_file(&hash_path, &hash).await {
+                                Ok(true) => (file, false),
+                                _ => (file, true), // 文件验证失败或错误
+                            }
+                        } else {
+                            (file, false) // 文件存在且大小匹配
+                        }
                     }
-                }
-            })
-            .buffer_unordered(32) // 最多同时进行32个并发任务
-            .collect::<Vec<(FileInfo, bool)>>()
-            .await;
-        
-        // 处理结果
-        for (file, is_missing) in results {
-            if is_missing {
-                missing_files.push(file);
-            }
+                })
+                .buffer_unordered(200) // 最多同时进行200个并发任务
+                .collect::<Vec<(FileInfo, bool)>>()
+                .await;
+            
+            // 处理本批次结果
+            let batch_missing = results.into_iter()
+                .filter_map(|(file, is_missing)| if is_missing { Some(file) } else { None })
+                .collect::<Vec<_>>();
+            
+            let batch_duration = batch_start.elapsed();
+            info!("批次 {}/{} 完成，耗时 {:.2}s，发现 {} 个缺失文件", 
+                 batch_index + 1, (total_files + batch_size - 1) / batch_size, 
+                 batch_duration.as_secs_f64(), batch_missing.len());
+            
+            // 添加到总缺失文件列表
+            missing_files.extend(batch_missing);
         }
         
         if !missing_files.is_empty() {
-            info!("发现 {} 个缺失或损坏的文件", missing_files.len());
+            info!("检查完成，共发现 {} 个缺失或损坏的文件", missing_files.len());
         } else {
-            info!("所有文件完整性检查通过");
+            info!("检查完成，所有文件完整性检查通过");
         }
         
         Ok(missing_files)
@@ -348,6 +437,7 @@ impl Clone for FileStorage {
     fn clone(&self) -> Self {
         Self {
             cache_dir: self.cache_dir.clone(),
+            verified_hashes: self.verified_hashes.clone(),
         }
     }
 } 

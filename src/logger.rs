@@ -4,6 +4,7 @@
 use anyhow::Result;
 use chrono::Local;
 use env_logger::fmt::Color;
+use indicatif::MultiProgress;
 use log::{Level, LevelFilter};
 use std::fs::create_dir_all;
 use std::io::{self, Write};
@@ -13,6 +14,11 @@ use std::time::Duration;
 
 // 用于控制清理线程的标志
 static CLEANER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// 全局MultiProgress实例，可以被其他模块共享使用
+lazy_static::lazy_static! {
+    pub static ref MULTI_PROGRESS: MultiProgress = MultiProgress::new();
+}
 
 pub fn setup() -> Result<()> {
     // 如果已经通过其他方式初始化了日志系统，这个方法就是空操作
@@ -51,12 +57,14 @@ pub fn init_logger() -> Result<()> {
 
     impl Write for DualWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            // 先写入控制台
-            let console_result = self.console.write(buf);
-            // 再写入文件
-            let _ = self.file.write(buf);
-            // 返回控制台的写入结果
-            console_result
+            // 临时隐藏所有进度条
+            let multi_progress = MULTI_PROGRESS.clone();
+            multi_progress.suspend(|| {
+                // 在进度条被隐藏的情况下写入日志
+                let console_result = self.console.write(buf);
+                let _ = self.file.write(buf);
+                console_result
+            })
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -105,7 +113,7 @@ pub fn init_logger() -> Result<()> {
         // 使用自定义的双重输出Writer
         .target(env_logger::Target::Pipe(Box::new(dual_writer)))
         .init();
-
+    
     // 启动一个后台线程，定期清理日志文件，保持最多5个文件
     // 使用原子变量确保清理线程只启动一次
     if !CLEANER_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {

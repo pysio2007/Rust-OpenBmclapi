@@ -1455,8 +1455,8 @@ impl Cluster {
         
         info!("总计需要下载: {} 个文件, {} 字节", total_count, total_bytes);
         
-        // 创建多进度条
-        let multi_progress = indicatif::MultiProgress::new();
+        // 使用全局共享的MULTI_PROGRESS实例
+        let multi_progress = crate::logger::MULTI_PROGRESS.clone();
         
         // 创建总进度条
         let total_progress = multi_progress.add(indicatif::ProgressBar::new(total_bytes));
@@ -1465,7 +1465,9 @@ impl Cluster {
             .unwrap()
             .progress_chars("=>-"));
             
-        let multi_progress = Arc::new(multi_progress);
+        // 设置进度条无阻塞绘制，防止被日志顶掉
+        total_progress.enable_steady_tick(std::time::Duration::from_millis(100));
+            
         let total_progress = Arc::new(total_progress);
         
         use futures::stream::{self, StreamExt};
@@ -1489,10 +1491,14 @@ impl Cluster {
                         .unwrap()
                         .progress_chars("=>-"));
                     
+                    // 启用稳定的后台刷新，减少被日志覆盖的可能性
+                    file_progress.enable_steady_tick(std::time::Duration::from_millis(100));
+                    
                     let filename = file.path.split('/').last().unwrap_or(&file.path);
                     file_progress.set_message(filename.to_string());
                     
-                    info!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
+                    // 用debug级别记录开始下载信息，避免过多info日志干扰进度条
+                    debug!("开始下载文件: {} (大小: {} 字节)", file.path, file.size);
                     
                     for retry in 0..10 {
                         if retry > 0 {
@@ -1546,6 +1552,11 @@ impl Cluster {
                                             }
                                             
                                             file_progress.finish_with_message(format!("{} - 完成", filename));
+                                            file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                                                .template("[{filename}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
+                                                .unwrap()
+                                                .progress_chars("=>-"));
+                                            
                                             total_progress.inc(file.size);
                                             debug!("文件 {} 同步成功", file.path);
                                             return Ok(file.path.clone());
@@ -1589,6 +1600,11 @@ impl Cluster {
                                                                 }
                                                                 
                                                                 file_progress.finish_with_message(format!("{} - 完成", filename));
+                                                                file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                                                                    .template("[{filename}] [{bar:40.bright_green/red}] {bytes}/{total_bytes} ✓")
+                                                                    .unwrap()
+                                                                    .progress_chars("=>-"));
+                                                                
                                                                 total_progress.inc(file.size);
                                                                 debug!("文件 {} 同步成功", file.path);
                                                                 return Ok(file.path.clone());
@@ -1626,6 +1642,11 @@ impl Cluster {
                     }
                     
                     file_progress.finish_with_message(format!("{} - 失败", filename));
+                    file_progress.set_style(indicatif::ProgressStyle::default_bar()
+                        .template("[{filename}] [{bar:40.red/red}] {bytes}/{total_bytes} ✗")
+                        .unwrap()
+                        .progress_chars("=>-"));
+                    
                     error!("下载文件 {} 失败，已重试多次", file.path);
                     Err(anyhow!("下载文件 {} 失败", file.path))
                 }
@@ -1635,6 +1656,10 @@ impl Cluster {
             .await;
         
         total_progress.finish_with_message("下载完成");
+        total_progress.set_style(indicatif::ProgressStyle::default_bar()
+            .template("[总进度] [{bar:40.bright_green/blue}] {bytes}/{total_bytes} ✓")
+            .unwrap()
+            .progress_chars("=>-"));
         
         let mut has_error = false;
         for result in &results {

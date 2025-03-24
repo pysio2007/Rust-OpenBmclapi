@@ -105,7 +105,7 @@ impl Storage for FileStorage {
         }
         
         if !self.cache_dir.is_dir() {
-            return Err(anyhow::anyhow!("缓存目录不是一个目录"));
+            return Err(anyhow::anyhow!("文件目录不是一个目录"));
         }
         
         // 检查是否有写入权限
@@ -161,7 +161,7 @@ impl Storage for FileStorage {
         info!("开始检查 {} 个文件", total_files);
         
         // 首先预扫描并建立索引，避免逐个查询文件系统
-        info!("预扫描缓存目录，建立索引...");
+        info!("预扫描文件目录，建立索引...");
         let mut _file_index: std::collections::HashMap<String, std::path::PathBuf> = std::collections::HashMap::new();
         let mut _size_index: std::collections::HashMap<std::path::PathBuf, u64> = std::collections::HashMap::new();
         

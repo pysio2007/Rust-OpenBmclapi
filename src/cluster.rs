@@ -75,8 +75,6 @@ impl Cluster {
             .user_agent(&user_agent)
             .build()?;
         
-        let storage = Arc::new(get_storage(&config));
-        
         let base_url = std::env::var("CLUSTER_BMCLAPI")
             .unwrap_or_else(|_| "https://openbmclapi.bangbang93.com".to_string());
             
@@ -90,7 +88,9 @@ impl Cluster {
         
         // 确保cache目录存在
         std::fs::create_dir_all(&cache_dir)?;
-        info!("使用缓存目录: {:?}", cache_dir);
+        info!("使用文件目录: {:?}", cache_dir);
+        
+        let storage = Arc::new(get_storage(&config, Some(cache_dir.clone())));
         
         Ok(Cluster {
             client,

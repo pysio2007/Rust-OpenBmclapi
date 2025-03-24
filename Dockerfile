@@ -28,7 +28,7 @@ COPY --from=builder /usr/src/rust-bmclapi/target/release/rust-bmclapi /app/
 # 复制示例配置文件
 COPY --from=builder /usr/src/rust-bmclapi/.env.example /app/
 
-# 创建缓存目录
+# 创建文件目录
 RUN mkdir -p /app/cache
 
 # 设置环境变量

@@ -39,11 +39,12 @@ pub trait Storage: Send + Sync {
     async fn handle_bytes_request(&self, hash_path: &str, req: Request<&[u8]>) -> Result<Response<axum::body::Body>>;
 }
 
-pub fn get_storage(config: &Config) -> Box<dyn Storage> {
+pub fn get_storage(config: &Config, cache_dir: Option<std::path::PathBuf>) -> Box<dyn Storage> {
     match config.storage.as_str() {
         "file" => {
-            let storage = FileStorage::new(Path::new("cache").to_path_buf());
-            info!("使用文件存储");
+            let path = cache_dir.unwrap_or_else(|| Path::new("cache").to_path_buf());
+            let storage = FileStorage::new(path.clone());
+            info!("使用文件存储，文件目录: {:?}", path);
             Box::new(storage)
         }
         "alist" => {

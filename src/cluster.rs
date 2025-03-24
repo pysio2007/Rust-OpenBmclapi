@@ -194,6 +194,20 @@ impl Cluster {
                             }
                         };
                         
+                        // 处理错误情况：[Array [Array [Object {"message": String("错误信息")}]]]
+                        if inner_array.len() >= 1 && inner_array[0].is_object() {
+                            if let Some(err_obj) = inner_array[0].as_object() {
+                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                    error!("主控服务器返回证书错误: {}", msg);
+                                    return;
+                                }
+                            }
+                            
+                            // 如果没有message字段但有错误对象
+                            error!("主控服务器返回未知证书错误对象: {:?}", inner_array[0]);
+                            return;
+                        }
+                        
                         if inner_array.len() < 2 {
                             error!("证书响应格式错误: 内层数组长度不足，需要至少两个元素");
                             return;
@@ -711,12 +725,31 @@ impl Cluster {
                             if let Some(inner_array) = values[0].as_array() {
                                 if inner_array.len() == 1 && inner_array[0].is_array() {
                                     if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        // 成功情况：[Array [Array [Null, Bool(true)]]]
                                         if inner_inner_array.len() >= 2 && 
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
                                            inner_inner_array[1].as_bool().unwrap_or(false) {
                                             info!("节点注册成功，等待节点启用 ");
                                             let _ = tx.send(Ok(())).await;
+                                            return;
+                                        }
+                                        
+                                        // 错误情况：[Array [Array [Object {"message": String("错误信息")}]]]
+                                        if inner_inner_array.len() >= 1 && inner_inner_array[0].is_object() {
+                                            if let Some(err_obj) = inner_inner_array[0].as_object() {
+                                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                                    let err = format!("主控服务器返回错误: {}", msg);
+                                                    error!("{}", err);
+                                                    let _ = tx.send(Err(anyhow!(err))).await;
+                                                    return;
+                                                }
+                                            }
+                                            
+                                            // 如果没有message字段但有错误对象
+                                            let err = format!("主控服务器返回未知错误对象: {:?}", inner_inner_array[0]);
+                                            error!("{}", err);
+                                            let _ = tx.send(Err(anyhow!(err))).await;
                                             return;
                                         }
                                     }
@@ -866,6 +899,7 @@ impl Cluster {
                             if let Some(inner_array) = values[0].as_array() {
                                 if inner_array.len() == 1 && inner_array[0].is_array() {
                                     if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        // 成功情况：[Array [Array [Null, Bool(true)]]]
                                         if inner_inner_array.len() >= 2 && 
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
@@ -873,6 +907,20 @@ impl Cluster {
                                             info!("节点已成功禁用 ");
                                             let mut is_enabled_guard = is_enabled.write().unwrap();
                                             *is_enabled_guard = false;
+                                            return;
+                                        }
+                                        
+                                        // 错误情况：[Array [Array [Object {"message": String("错误信息")}]]]
+                                        if inner_inner_array.len() >= 1 && inner_inner_array[0].is_object() {
+                                            if let Some(err_obj) = inner_inner_array[0].as_object() {
+                                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                                    error!("主控服务器返回错误: {}", msg);
+                                                    return;
+                                                }
+                                            }
+                                            
+                                            // 如果没有message字段但有错误对象
+                                            error!("主控服务器返回未知错误对象: {:?}", inner_inner_array[0]);
                                             return;
                                         }
                                     }
@@ -2088,12 +2136,31 @@ impl Cluster {
                             if let Some(inner_array) = values[0].as_array() {
                                 if inner_array.len() == 1 && inner_array[0].is_array() {
                                     if let Some(inner_inner_array) = inner_array[0].as_array() {
+                                        // 成功情况：[Array [Array [Null, Bool(true)]]]
                                         if inner_inner_array.len() >= 2 && 
                                            inner_inner_array[0].is_null() && 
                                            inner_inner_array[1].is_boolean() && 
                                            inner_inner_array[1].as_bool().unwrap_or(false) {
                                             info!("端口检查成功 ");
                                             let _ = tx.send(Ok(())).await;
+                                            return;
+                                        }
+                                        
+                                        // 错误情况：[Array [Array [Object {"message": String("错误信息")}]]]
+                                        if inner_inner_array.len() >= 1 && inner_inner_array[0].is_object() {
+                                            if let Some(err_obj) = inner_inner_array[0].as_object() {
+                                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                                    let err_msg = format!("主控服务器返回错误: {}", msg);
+                                                    error!("{}", err_msg);
+                                                    let _ = tx.send(Err(anyhow!(err_msg))).await;
+                                                    return;
+                                                }
+                                            }
+                                            
+                                            // 如果没有message字段但有错误对象
+                                            let err_msg = format!("主控服务器返回未知错误对象: {:?}", inner_inner_array[0]);
+                                            error!("{}", err_msg);
+                                            let _ = tx.send(Err(anyhow!(err_msg))).await;
                                             return;
                                         }
                                     }

@@ -1624,6 +1624,13 @@ impl Cluster {
                                                         let _ = tokio::fs::remove_file(&temp_path).await;
                                                         continue 'retry_loop; // 跳转到外层循环重试
                                                     }
+                                                    
+                                                    // 显式刷新以确保数据写入磁盘
+                                                    if downloaded_size % 1024000 == 0 {
+                                                        if let Err(e) = temp_file.flush().await {
+                                                            error!("刷新文件数据失败: {}", e);
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     error!("下载文件流出错: {}", e);
@@ -1631,6 +1638,8 @@ impl Cluster {
                                                     continue 'retry_loop; // 跳转到外层循环重试
                                                 }
                                             }
+                                            
+                                            // 显式释放chunk内存
                                         }
                                         
                                         // 关闭文件
@@ -1640,22 +1649,52 @@ impl Cluster {
                                             continue;
                                         }
                                         
-                                        // 校验文件哈希
+                                        // 计算并校验文件哈希
                                         let hash_hex = hasher.finalize();
                                         let calculated_hash = format!("{:x}", hash_hex);
                                         
-                                        // 读取文件内容进行验证，确保能够正确处理不同哈希算法
-                                        let content = match tokio::fs::read(&temp_path).await {
-                                            Ok(data) => data,
-                                            Err(e) => {
-                                                error!("读取临时文件失败: {}", e);
-                                                let _ = tokio::fs::remove_file(&temp_path).await;
-                                                continue;
-                                            }
+                                        // 直接比较哈希值，避免再次读取整个文件
+                                        let is_valid = if file_info.hash.len() == 40 {
+                                            // SHA1
+                                            file_info.hash.to_lowercase() == calculated_hash
+                                        } else if file_info.hash.len() == 32 {
+                                            // MD5 - 需要重新计算
+                                            let file_content = match tokio::fs::read(&temp_path).await {
+                                                Ok(content) => content,
+                                                Err(e) => {
+                                                    error!("读取临时文件失败: {}", e);
+                                                    let _ = tokio::fs::remove_file(&temp_path).await;
+                                                    continue;
+                                                }
+                                            };
+                                            
+                                            let md5_digest = md5::compute(&file_content);
+                                            let md5_hex = format!("{:x}", md5_digest);
+                                            
+                                            // 释放file_content内存
+                                            drop(file_content);
+                                            
+                                            file_info.hash.to_lowercase() == md5_hex
+                                        } else {
+                                            // 其他长度哈希，需要使用通用验证函数
+                                            let content = match tokio::fs::read(&temp_path).await {
+                                                Ok(data) => data,
+                                                Err(e) => {
+                                                    error!("读取临时文件失败: {}", e);
+                                                    let _ = tokio::fs::remove_file(&temp_path).await;
+                                                    continue;
+                                                }
+                                            };
+                                            
+                                            let valid = validate_file(&content, &file_info.hash);
+                                            
+                                            // 释放content内存
+                                            drop(content);
+                                            
+                                            valid
                                         };
                                         
-                                        // 使用统一的验证函数进行校验
-                                        if !validate_file(&content, &file_info.hash) {
+                                        if !is_valid {
                                             error!("文件校验失败: 期望={}, 实际={}", file_info.hash, calculated_hash);
                                             let _ = tokio::fs::remove_file(&temp_path).await;
                                             continue;
@@ -1667,6 +1706,9 @@ impl Cluster {
                                             let _ = tokio::fs::remove_file(&temp_path).await;
                                             continue;
                                         }
+                                        
+                                        // 关闭临时文件句柄
+                                        drop(temp_file);
                                         
                                         // 重命名临时文件为最终文件
                                         if let Err(e) = tokio::fs::rename(&temp_path, &full_path).await {
@@ -1757,6 +1799,13 @@ impl Cluster {
                                                                             let _ = tokio::fs::remove_file(&temp_path).await;
                                                                             continue 'retry_loop; // 跳转到外层循环重试
                                                                         }
+                                                                        
+                                                                        // 显式刷新以确保数据写入磁盘
+                                                                        if downloaded_size % 1024000 == 0 {
+                                                                            if let Err(e) = temp_file.flush().await {
+                                                                                error!("刷新文件数据失败: {}", e);
+                                                                            }
+                                                                        }
                                                                     }
                                                                     Err(e) => {
                                                                         error!("下载文件流出错: {}", e);
@@ -1764,6 +1813,8 @@ impl Cluster {
                                                                         continue 'retry_loop; // 跳转到外层循环重试
                                                                     }
                                                                 }
+                                                                
+                                                                // 显式释放chunk内存
                                                             }
                                                             
                                                             // 关闭文件
@@ -1773,22 +1824,52 @@ impl Cluster {
                                                                 continue;
                                                             }
                                                             
-                                                            // 校验文件哈希
+                                                            // 计算并校验文件哈希
                                                             let hash_hex = hasher.finalize();
                                                             let calculated_hash = format!("{:x}", hash_hex);
                                                             
-                                                            // 读取文件内容进行验证，确保能够正确处理不同哈希算法
-                                                            let content = match tokio::fs::read(&temp_path).await {
-                                                                Ok(data) => data,
-                                                                Err(e) => {
-                                                                    error!("读取临时文件失败: {}", e);
-                                                                    let _ = tokio::fs::remove_file(&temp_path).await;
-                                                                    continue;
-                                                                }
+                                                            // 直接比较哈希值，避免再次读取整个文件
+                                                            let is_valid = if file_info.hash.len() == 40 {
+                                                                // SHA1
+                                                                file_info.hash.to_lowercase() == calculated_hash
+                                                            } else if file_info.hash.len() == 32 {
+                                                                // MD5 - 需要重新计算
+                                                                let file_content = match tokio::fs::read(&temp_path).await {
+                                                                    Ok(content) => content,
+                                                                    Err(e) => {
+                                                                        error!("读取临时文件失败: {}", e);
+                                                                        let _ = tokio::fs::remove_file(&temp_path).await;
+                                                                        continue;
+                                                                    }
+                                                                };
+                                                                
+                                                                let md5_digest = md5::compute(&file_content);
+                                                                let md5_hex = format!("{:x}", md5_digest);
+                                                                
+                                                                // 释放file_content内存
+                                                                drop(file_content);
+                                                                
+                                                                file_info.hash.to_lowercase() == md5_hex
+                                                            } else {
+                                                                // 其他长度哈希，需要使用通用验证函数
+                                                                let content = match tokio::fs::read(&temp_path).await {
+                                                                    Ok(data) => data,
+                                                                    Err(e) => {
+                                                                        error!("读取临时文件失败: {}", e);
+                                                                        let _ = tokio::fs::remove_file(&temp_path).await;
+                                                                        continue;
+                                                                    }
+                                                                };
+                                                                
+                                                                let valid = validate_file(&content, &file_info.hash);
+                                                                
+                                                                // 释放content内存
+                                                                drop(content);
+                                                                
+                                                                valid
                                                             };
                                                             
-                                                            // 使用统一的验证函数进行校验
-                                                            if !validate_file(&content, &file_info.hash) {
+                                                            if !is_valid {
                                                                 error!("文件校验失败: 期望={}, 实际={}", file_info.hash, calculated_hash);
                                                                 let _ = tokio::fs::remove_file(&temp_path).await;
                                                                 continue;
@@ -1800,6 +1881,9 @@ impl Cluster {
                                                                 let _ = tokio::fs::remove_file(&temp_path).await;
                                                                 continue;
                                                             }
+                                                            
+                                                            // 关闭临时文件句柄
+                                                            drop(temp_file);
                                                             
                                                             // 重命名临时文件为最终文件
                                                             if let Err(e) = tokio::fs::rename(&temp_path, &full_path).await {

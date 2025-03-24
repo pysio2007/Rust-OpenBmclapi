@@ -19,7 +19,7 @@ BMCLAPI是@bangbang93开发的BMCL的一部分，用于解决国内线路对Forg
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/rust-bmclapi.git
+git clone https://github.com/pysio2007/Rust-OpenBmclapi.git
 cd rust-bmclapi
 
 # 编译项目

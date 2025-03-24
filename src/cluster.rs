@@ -296,7 +296,7 @@ impl Cluster {
 
         info!("发送证书请求...");
         let res = socket
-            .emit_with_ack("request-cert", "", Duration::from_secs(10), ack_callback)
+            .emit_with_ack("request-cert", "", Duration::from_secs(300), ack_callback)
             .await;
             
         tokio::time::sleep(Duration::from_secs(5)).await;

@@ -6,59 +6,63 @@ authors = ["Pysio <qq593277393@outlook.com>"]
 description = "Rust implementation of OpenBMCLAPI"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["multipart"] }
-axum-server = { version = "0.6", features = ["tls-rustls"] }
-hyper = { version = "1.0", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-reqwest = { version = "0.11", features = ["json", "stream"] }
-dotenv = "0.15"
-config = "0.13"
-clap = { version = "4.4", features = ["derive"] }
-futures = "0.3"
-futures-util = "0.3"
-bytes = "1.5"
-sha2 = "0.10"
-sha1 = "0.10"
-hex = "0.4"
-hmac = "0.12"
-base64 = "0.21"
-chrono = { version = "0.4", features = ["serde"] }
-anyhow = "1.0"
-thiserror = "1.0"
+# 异步运行时和核心依赖
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util", "sync", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["codec"] }
-tokio-stream = "0.1"
-tempfile = "3.8"
-indicatif = "0.17"
-colored = "2.0"
-log = "0.4"
-env_logger = "0.10"
-zstd = "0.13"
-socket2 = "0.5"
-# igd = "0.12"
-rupnp = { version = "1.1", default-features = false, features = ["tokio"] }
-jsonwebtoken = "8.3"
-async-recursion = "1.0"
-lazy_static = "1.4"
-url = "2.4"
-winapi = { version = "0.3", features = ["processthreadsapi", "handleapi"] }
-num_cpus = "1.16"
-# Socket.IO客户端
-rust_socketio = { version = "0.6.0", features = ["async"] }
-# SSL和HTTPS相关依赖
-hyper-rustls = "0.25"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# HTTP服务器和框架
+axum = "0.7"
+axum-server = { version = "0.6", features = ["tls-rustls"] }
+hyper = { version = "1.0", features = ["server", "http1", "http2"] }
+
+# HTTP客户端
+reqwest = { version = "0.11", features = ["json", "stream"] }
+
+# SSL/TLS
 rustls = "0.22"
 rustls-pemfile = "2.0"
 rustls-pki-types = "1.0"
-async-stream = "0.3"
-# AVRO格式解析
-apache-avro = "0.16"
+
+# 序列化和解析
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 加密和哈希
+sha2 = "0.10"
+sha1 = "0.10"
 md5 = "0.7.0"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.21"
+jsonwebtoken = "8.3"
+
+# 日志和监控
+log = "0.4"
+env_logger = "0.10"
+tracing-appender = "0.2"
+indicatif = "0.17"
 indicatif-log-bridge = "0.2.3"
+colored = "2.0"
+
+# 错误处理
+anyhow = "1.0"
+
+# 配置和环境
+dotenv = "0.15"
+
+# 数据处理
+bytes = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+zstd = { version = "0.13", default-features = false }
+url = "2.4"
+
+# 工具库
+lazy_static = "1.4"
+
+# Socket.IO客户端
+rust_socketio = { version = "0.6.0", features = ["async"] }
+
+# UPnP支持
+rupnp = { version = "1.1", default-features = false, features = ["tokio"] }

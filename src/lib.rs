@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod cluster;
 pub mod config;
 pub mod constants;
+pub mod error_handler;
 pub mod file;
 pub mod keepalive;
 pub mod logger;

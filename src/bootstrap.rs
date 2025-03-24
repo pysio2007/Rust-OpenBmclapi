@@ -10,6 +10,7 @@ use tokio::time::{self};
 use crate::cluster::Cluster;
 use crate::config::CONFIG;
 use crate::constants::DEFAULT_KEEPALIVE_INTERVAL;
+use crate::error_handler;
 use crate::keepalive::Keepalive;
 use crate::token::TokenManager;
 use crate::types::FileList;
@@ -40,7 +41,12 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     
     // 添加：建立持久Socket.IO连接
     info!("建立Socket.IO持久连接...");
-    cluster.connect().await?;
+    if let Err(e) = cluster.connect().await {
+        error!("建立Socket.IO连接失败: {}", e);
+        // 记录错误但继续抛出
+        error_handler::handle_registration_failure().await?;
+        return Err(anyhow!("建立Socket.IO连接失败"));
+    }
     
     // 设置HTTPS
     let _use_https = true; // 默认使用HTTPS
@@ -53,11 +59,19 @@ pub async fn bootstrap(version: &str) -> Result<()> {
             info!("未提供证书和密钥，将使用HTTP");
         } else {
             info!("使用自定义证书");
-            cluster.use_self_cert().await?;
+            if let Err(e) = cluster.use_self_cert().await {
+                error!("使用自定义证书失败: {}", e);
+                // 记录错误但继续抛出
+                error_handler::handle_registration_failure().await?;
+                return Err(anyhow!("使用自定义证书失败"));
+            }
         }
     } else {
         info!("请求证书");
         if !cluster.request_cert().await {
+            error!("请求证书失败");
+            // 记录错误但继续抛出
+            error_handler::handle_registration_failure().await?;
             return Err(anyhow!("请求证书失败"));
         }
     }
@@ -72,9 +86,15 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     let server_handle = if is_https {
         info!("使用HTTPS模式启动服务器于端口 {}", config.port);
         // 启动HTTPS服务器
-        let _ = cluster.setup_server_with_https(true).await?;
-        // HTTPS服务器已在setup_server_with_https方法中启动
-        None 
+        match cluster.setup_server_with_https(true).await {
+            Ok(_) => None,
+            Err(e) => {
+                error!("HTTPS服务器启动失败: {}", e);
+                // 记录错误但继续抛出
+                error_handler::handle_registration_failure().await?;
+                return Err(anyhow!("HTTPS服务器启动失败"));
+            }
+        }
     } else {
         info!("使用HTTP模式启动服务器于端口 {}", config.port);
         let router = cluster.setup_server().await;
@@ -89,24 +109,55 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     
     // 获取文件列表
     info!("获取文件列表...");
-    let files = cluster.get_file_list(None).await?;
-    info!("获取到 {} 个文件", files.files.len());
+    let files = match cluster.get_file_list(None).await {
+        Ok(files) => {
+            info!("获取到 {} 个文件", files.files.len());
+            files
+        },
+        Err(e) => {
+            error!("获取文件列表失败: {}", e);
+            // 记录错误但继续抛出
+            error_handler::handle_registration_failure().await?;
+            return Err(anyhow!("获取文件列表失败"));
+        }
+    };
     
     // 获取配置
-    let configuration = cluster.get_configuration().await?;
+    let configuration = match cluster.get_configuration().await {
+        Ok(config) => config,
+        Err(e) => {
+            error!("获取配置失败: {}", e);
+            // 记录错误但继续抛出
+            error_handler::handle_registration_failure().await?;
+            return Err(anyhow!("获取配置失败"));
+        }
+    };
     
     // 检查存储状态
     if !cluster.get_storage().check().await? {
+        error!("存储异常");
+        // 记录错误但继续抛出
+        error_handler::handle_registration_failure().await?;
         return Err(anyhow!("存储异常"));
     }
     
     // 同步文件
     info!("开始同步文件...");
-    cluster.sync_files(&files, &configuration).await?;
+    if let Err(e) = cluster.sync_files(&files, &configuration).await {
+        error!("同步文件失败: {}", e);
+        // 记录错误但继续抛出
+        error_handler::handle_registration_failure().await?;
+        return Err(anyhow!("同步文件失败"));
+    }
     
     // 垃圾回收
     info!("启动垃圾回收...");
-    cluster.gc_background(&files).await?;
+    if let Err(e) = cluster.gc_background(&files).await {
+        error!("垃圾回收启动失败: {}", e);
+        // 记录错误但继续抛出
+        error_handler::handle_registration_failure().await?;
+        return Err(anyhow!("垃圾回收启动失败"));
+    }
     
     // 进行端口检查
     info!("检查端口可达性...");
@@ -118,7 +169,12 @@ pub async fn bootstrap(version: &str) -> Result<()> {
     
     // 启用节点
     info!("请求上线...");
-    cluster.enable().await?;
+    if let Err(e) = cluster.enable().await {
+        error!("节点注册失败: {}", e);
+        // 记录错误但继续抛出
+        error_handler::handle_registration_failure().await?;
+        return Err(anyhow!("节点注册失败"));
+    }
     
     info!("{}", format!("服务完成初始化，共 {} 个文件", files.files.len()).green());
     

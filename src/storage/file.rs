@@ -8,7 +8,6 @@ use tokio::fs;
 use tokio_util::io::ReaderStream;
 use colored::Colorize;
 use tokio::time::{sleep, Duration};
-use sha1::{Sha1, Digest};
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 use futures::stream::{self, StreamExt};
@@ -16,7 +15,7 @@ use futures::stream::{self, StreamExt};
 use log::{info, warn, error, debug};
 use crate::storage::base::Storage;
 use crate::types::{FileInfo, GCCounter};
-use crate::util::hash_to_filename;
+use crate::util::{hash_to_filename, validate_file};
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: u64 = 5;
@@ -32,7 +31,9 @@ impl FileStorage {
     
     async fn verify_file(&self, path: &str, expected_hash: &str) -> Result<bool> {
         let file_path = self.cache_dir.join(path);
+        debug!("验证文件: {}, 预期哈希: {}", file_path.display(), expected_hash);
         
+        // 读取文件内容
         let content = match fs::read(&file_path).await {
             Ok(content) => content,
             Err(e) => {
@@ -41,11 +42,16 @@ impl FileStorage {
             }
         };
         
-        let mut hasher = Sha1::new();
-        hasher.update(&content);
-        let actual_hash = format!("{:x}", hasher.finalize());
+        // 使用公共验证函数
+        let is_valid = validate_file(&content, expected_hash);
         
-        Ok(actual_hash.to_lowercase() == expected_hash.to_lowercase())
+        if !is_valid {
+            warn!("文件哈希验证失败: {}", file_path.display());
+        } else {
+            debug!("文件哈希验证成功: {}", file_path.display());
+        }
+        
+        Ok(is_valid)
     }
     
     async fn retry_operation<F, Fut, T>(&self, operation: F, description: &str) -> Result<T>

@@ -13,6 +13,9 @@ use md5;
 
 // 将哈希值转换为文件名
 pub fn hash_to_filename(hash: &str) -> String {
+    if hash.len() < 2 {
+        return hash.to_string(); // 防止哈希值过短导致错误
+    }
     // 始终使用 / 作为分隔符，避免平台差异
     format!("{}/{}", &hash[0..2], hash)
 }
@@ -85,13 +88,15 @@ pub fn check_sign(path: &str, secret: &str, query: &HashMap<String, String>) -> 
         None => return false,
     };
     
-    // 处理路径 - 确保与TS版本一致
-    // TypeScript版本直接使用hash作为路径参数，不带前缀
+    // 处理路径 - 确保与NodeJS版本一致
     let actual_path = if path.starts_with("/download/") {
         // 如果传入的是带/download/前缀的路径，提取出hash
         path.strip_prefix("/download/").unwrap_or(path)
+    } else if path.starts_with("/") {
+        // 保留其他以/开头的路径，不做处理
+        path
     } else {
-        // 已经是hash或其他格式的路径
+        // 当直接传入hash值时，确保一致性
         path
     };
     
@@ -129,32 +134,39 @@ pub fn check_sign(path: &str, secret: &str, query: &HashMap<String, String>) -> 
     sign_match && not_expired
 }
 
-// 修改validate_file函数，添加忽略大小写和跨平台路径处理，并支持SHA1和MD5两种哈希算法
 pub fn validate_file(data: &[u8], hash: &str) -> bool {
     let expected = hash.to_lowercase().trim().to_string();
     
     // 根据哈希长度判断使用哪种算法
-    if expected.len() == 32 {
+    let result = if expected.len() == 32 {
         // MD5哈希 (32位)
         let digest = md5::compute(data);
-        let actual = format!("{:x}", digest).to_lowercase();
+        let actual = format!("{:x}", digest);
         
         if expected != actual {
-            log::debug!("MD5哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+            log::debug!("MD5哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", 
+                      data.len(), actual, expected);
+            false
+        } else {
+            true
         }
-        
-        actual == expected
-    } else {
+    } else if expected.len() == 40 {
         // SHA1哈希 (40位)
-        use sha1::{Sha1, Digest};
         let mut hasher = Sha1::new();
         hasher.update(data);
-        let actual = format!("{:x}", hasher.finalize()).to_lowercase();
+        let actual = format!("{:x}", hasher.finalize());
         
         if expected != actual {
-            log::debug!("SHA1哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", data.len(), actual, expected);
+            log::debug!("SHA1哈希校验失败 - 文件大小: {} 字节, 计算哈希: {}, 期望哈希: {}", 
+                      data.len(), actual, expected);
+            false
+        } else {
+            true
         }
-        
-        actual == expected
-    }
+    } else {
+        log::warn!("未知的哈希算法: 哈希长度 {}", expected.len());
+        false
+    };
+    
+    result
 } 

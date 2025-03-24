@@ -30,7 +30,6 @@ use crate::storage::get_storage;
 use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
-use crate::util::check_sign;
 
 const USER_AGENT: &str = "openbmclapi-cluster/1.13.1 rust-openbmclapi-cluster";
 
@@ -1866,14 +1865,14 @@ async fn serve_file(
 ) -> impl IntoResponse {
     let storage = cluster.get_storage();
     
-    // 仅获取User-Agent信息，不再获取IP
+    // 记录用户代理
     let user_agent = req.headers()
         .get(axum::http::header::USER_AGENT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("-");
     
-    // 客户端请求日志 - 不再包含IP信息
-    info!("文件下载请求 - UA: {}, 文件: {}", user_agent, hash);
+    // 客户端请求日志
+    info!("文件下载请求 - 文件: {}, UA: {}", hash, user_agent);
     
     // 处理查询参数，用于签名验证
     let mut query_params = HashMap::new();
@@ -1917,14 +1916,15 @@ async fn serve_file(
         config.cluster_secret.clone()
     };
     
+    // 使用规范的哈希路径格式进行签名验证
     debug!("签名验证参数: path={}, params={:?}", hash, query_params);
     
-    // 修改：直接使用hash作为path参数，而不是/download/hash前缀
+    // 直接使用hash作为签名验证路径参数，保持与其他语言版本一致性
     let sign_valid = crate::util::check_sign(&hash, &cluster_secret, &query_params);
     if !sign_valid {
         // 使用Apache风格日志记录签名验证失败
         error!("{} - - [{}] \"{} {} {}\" 403 0 \"-\" \"{}\"", 
-               user_agent, time_str, method, full_url, version, user_agent);
+               "anonymous", time_str, method, full_url, version, user_agent);
         
         return Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -1933,7 +1933,7 @@ async fn serve_file(
     }
     
     // 转换为存储中的文件名格式
-    let file_path = hash_to_filename(&hash);
+    let file_path = crate::util::hash_to_filename(&hash);
     
     // 检查文件是否存在
     let exists = match storage.exists(&file_path).await {
@@ -1942,7 +1942,7 @@ async fn serve_file(
             error!("检查文件存在性失败: {}", e);
             // 使用Apache风格日志记录内部错误
             error!("{} - - [{}] \"{} {} {}\" 500 0 \"-\" \"{}\"", 
-                   user_agent, time_str, method, full_url, version, user_agent);
+                   "anonymous", time_str, method, full_url, version, user_agent);
                    
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1954,7 +1954,7 @@ async fn serve_file(
     if !exists {
         // 使用Apache风格日志记录文件不存在
         error!("{} - - [{}] \"{} {} {}\" 404 0 \"-\" \"{}\"", 
-               user_agent, time_str, method, full_url, version, user_agent);
+               "anonymous", time_str, method, full_url, version, user_agent);
                
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -2183,7 +2183,6 @@ pub fn hash_to_filename(hash: &str) -> String {
     format!("{}/{}", &hash[0..2], hash)
 } 
 
-// 从openapi.rs移植过来的auth处理程序
 async fn auth_handler(
     req: Request,
 ) -> impl IntoResponse {
@@ -2195,16 +2194,33 @@ async fn auth_handler(
         None => return (StatusCode::FORBIDDEN, "Invalid request").into_response(),
     };
     
+    debug!("Auth handler - 原始URI: {}", original_uri);
+    
     // 解析URI
     let uri = match Url::parse(&format!("http://localhost{}", original_uri)) {
         Ok(uri) => uri,
-        Err(_) => return (StatusCode::FORBIDDEN, "Invalid URI").into_response(),
+        Err(e) => {
+            error!("无法解析URI '{}': {}", original_uri, e);
+            return (StatusCode::FORBIDDEN, "Invalid URI").into_response();
+        }
     };
     
     // 获取哈希和查询参数
     let path = uri.path();
-    let segments: Vec<&str> = path.split('/').collect();
-    let hash = segments.last().unwrap_or(&"");
+    debug!("Auth handler - 处理路径: {}", path);
+    
+    // 获取最后一个路径部分作为哈希
+    let hash = if let Some(last_segment) = path.split('/').last() {
+        if !last_segment.is_empty() {
+            last_segment
+        } else {
+            error!("URI路径没有有效的哈希部分: {}", path);
+            return (StatusCode::FORBIDDEN, "Invalid path format").into_response();
+        }
+    } else {
+        error!("无法从URI路径提取哈希部分: {}", path);
+        return (StatusCode::FORBIDDEN, "Invalid path").into_response();
+    };
     
     // 获取查询参数
     let mut query_params = HashMap::new();
@@ -2212,36 +2228,53 @@ async fn auth_handler(
         query_params.insert(key.to_string(), value.to_string());
     }
     
-    // 检查签名
-    if !check_sign(hash, &config.cluster_secret, &query_params) {
+    debug!("Auth handler - 处理签名验证: hash={}, params={:?}", hash, query_params);
+    
+    // 检查签名 - 直接使用哈希值进行验证
+    if !crate::util::check_sign(hash, &config.cluster_secret, &query_params) {
+        error!("签名验证失败 - hash: {}", hash);
         return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
     }
     
     // 返回成功
+    debug!("Auth handler - 签名验证成功: {}", hash);
     StatusCode::NO_CONTENT.into_response()
 }
 
-// 从openapi.rs移植过来的measure处理程序，完全基于TypeScript参考实现
+// 从openapi.rs移植过来的measure处理程序，完全基于NodeJS参考实现
 async fn measure_handler(
     Path(size): Path<u32>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    // 验证签名
+    debug!("Measure handler - 请求下载测量数据大小: {}MB", size);
+    
+    // 验证签名 - 使用规范的路径格式
     let config = CONFIG.read().unwrap();
     let path = format!("/measure/{}", size);
     
-    if !check_sign(&path, &config.cluster_secret, &params) {
+    debug!("Measure handler - 验证签名路径: {}, 参数: {:?}", path, params);
+    
+    if !crate::util::check_sign(&path, &config.cluster_secret, &params) {
+        error!("测量请求签名验证失败 - 路径: {}", path);
         return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
     }
     
     // 检查size是否有效
     if size > 200 {
+        warn!("测量请求大小超出限制: {}MB > 200MB", size);
         return (StatusCode::BAD_REQUEST, "Size too large").into_response();
     }
     
-    // 创建1MB的固定内容缓冲区，内容为"0066ccff"的重复（完全参考TypeScript实现）
+    // 创建1MB的固定内容缓冲区，内容为"0066ccff"的重复（完全参考NodeJS实现）
     let mut buffer = Vec::with_capacity(1024 * 1024);
-    let pattern = hex::decode("0066ccff").unwrap();
+    let pattern = match hex::decode("0066ccff") {
+        Ok(p) => p,
+        Err(e) => {
+            error!("无法解码测量模式数据: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Pattern decode error").into_response();
+        }
+    };
+    
     while buffer.len() < 1024 * 1024 {
         buffer.extend_from_slice(&pattern);
     }
@@ -2250,12 +2283,10 @@ async fn measure_handler(
     // 计算总大小
     let total_size = size as usize * buffer.len();
     
-    // 参考TypeScript版本，一次性创建完整响应
-    // TypeScript版本使用Buffer.alloc创建1MB缓冲区，然后循环写入响应
-    // 我们通过bytes::repeat实现类似功能，避免socket hang up问题
+    // 参考NodeJS版本，一次性创建完整响应
     let buffer_bytes = bytes::Bytes::from(buffer);
     
-    info!("发送测量响应，大小 {}MB", size);
+    info!("发送测量响应，大小 {}MB ({}字节)", size, total_size);
     
     Response::builder()
         .status(StatusCode::OK)

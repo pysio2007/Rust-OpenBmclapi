@@ -11,3 +11,5 @@ openbmclapi
 python-openbmclapi
 /python-openbmclapi
 .ssl
+go-openbmclapi
+logs

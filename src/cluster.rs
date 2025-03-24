@@ -1015,17 +1015,65 @@ impl Cluster {
 
         // 发送心跳
         debug!("发送心跳: {}", payload);
-        socket.emit("heartbeat", payload).await?;
-
-        // 心跳成功发送后，重置计数器
-        let mut counters = self.counters.write().unwrap();
-        let old_hits = counters.hits;
-        let old_bytes = counters.bytes;
-        counters.hits = 0;
-        counters.bytes = 0;
-        info!("心跳发送成功，更新计数器 - 本次上报计数 hits: {}, bytes: {}", old_hits, old_bytes);
-
-        Ok(())
+        match socket.emit("heartbeat", payload).await {
+            Ok(_) => {
+                // 心跳成功发送后，重置计数器
+                let mut counters = self.counters.write().unwrap();
+                let old_hits = counters.hits;
+                let old_bytes = counters.bytes;
+                counters.hits = 0;
+                counters.bytes = 0;
+                info!("心跳发送成功，更新计数器 - 本次上报计数 hits: {}, bytes: {}", old_hits, old_bytes);
+                
+                Ok(())
+            },
+            Err(e) => {
+                error!("心跳发送失败: {}", e);
+                
+                // 检测是否需要重新连接
+                if e.to_string().contains("not connected") || e.to_string().contains("connection") {
+                    warn!("检测到WebSocket连接已断开，尝试重新设置连接状态");
+                    {
+                        let mut is_enabled = self.is_enabled.write().unwrap();
+                        if *is_enabled {
+                            warn!("将节点状态设置为未启用，等待重新连接");
+                            *is_enabled = false;
+                        }
+                    }
+                    
+                    // 尝试重新连接
+                    if *self.want_enable.read().unwrap() {
+                        info!("节点希望保持启用状态，将在下一个循环中尝试重新连接");
+                        
+                        // 避免循环引用，只克隆需要的字段
+                        let base_url = self.base_url.clone();
+                        let token_manager = self.token_manager.clone();
+                        
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            info!("尝试重新连接到 {}", base_url);
+                            
+                            match token_manager.get_token().await {
+                                Ok(token) => {
+                                    let result = ClientBuilder::new(&base_url)
+                                        .transport_type(TransportType::Websocket)
+                                        .auth(json!({"token": token}))
+                                        .connect().await;
+                                        
+                                    match result {
+                                        Ok(_) => info!("重新连接成功"),
+                                        Err(e) => error!("重新连接失败: {}", e),
+                                    }
+                                },
+                                Err(e) => error!("获取令牌失败: {}", e),
+                            }
+                        });
+                    }
+                }
+                
+                Err(anyhow!("心跳发送失败: {}", e))
+            }
+        }
     }
     
     pub async fn connect(&self) -> Result<()> {

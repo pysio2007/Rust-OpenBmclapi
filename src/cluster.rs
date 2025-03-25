@@ -983,20 +983,21 @@ impl Cluster {
         if !*self.is_enabled.read().unwrap() {
             return Err(anyhow!("节点未启用"));
         }
-
+        
         // 获取当前计数器状态
         let current_counter = {
             let counters = self.counters.read().unwrap();
-            let counter_copy = counters.clone();
-            debug!("准备上报计数器数据 - hits: {}, bytes: {}", 
-                counter_copy.hits, counter_copy.bytes);
-            counter_copy
+            counters.clone()
         };
-
-        // 获取socket
+        
+        debug!("当前累计数据: {} 文件, {} 字节", current_counter.hits, current_counter.bytes);
+        
         let socket_result = {
             let socket_guard = self.socket.read().unwrap();
-            socket_guard.clone()
+            match &*socket_guard {
+                Some(socket) => Some(socket.clone()),
+                None => None,
+            }
         };
 
         let socket = match socket_result {
@@ -1016,70 +1017,111 @@ impl Cluster {
         // 发送心跳
         debug!("发送keep-alive: {}", payload);
         
-        // 使用emit_with_ack并正确处理响应
-        let result = socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), |response: Payload, _| {
-            async move {
-                match response {
-                    Payload::Text(values) => {
-                        debug!("处理keep-alive响应: {:?}", values);
-                        
-                        if values.is_empty() {
-                            warn!("keep-alive响应为空");
-                            debug!("收到的完整响应内容: {:?}", values);
-                            return;
-                        }
-                        
-                        // 第一层数组
-                        let outer_array = match values.get(0) {
-                            Some(array) if array.is_array() => array.as_array().unwrap(),
-                            _ => {
-                                warn!("keep-alive响应格式错误: 第一元素不是数组");
+        // 使用捕获panic的方式处理心跳发送
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
+            // 使用emit_with_ack并正确处理响应
+            socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), |response: Payload, _| {
+                async move {
+                    match response {
+                        Payload::Text(values) => {
+                            debug!("处理keep-alive响应: {:?}", values);
+                            
+                            if values.is_empty() {
+                                warn!("keep-alive响应为空");
                                 debug!("收到的完整响应内容: {:?}", values);
                                 return;
                             }
-                        };
-                        
-                        // 第二层数组
-                        let inner_array = match outer_array.get(0) {
-                            Some(array) if array.is_array() => array.as_array().unwrap(),
-                            _ => {
-                                warn!("keep-alive响应格式错误: 第二层元素不是数组");
-                                debug!("outer_array内容: {:?}", outer_array);
+                            
+                            // 使用更安全的方式处理多层数组
+                            let outer_array = match values.get(0) {
+                                Some(array) if array.is_array() => array.as_array().unwrap(),
+                                _ => {
+                                    warn!("keep-alive响应格式错误: 第一元素不是数组");
+                                    debug!("收到的完整响应内容: {:?}", values);
+                                    return;
+                                }
+                            };
+                            
+                            if outer_array.is_empty() {
+                                warn!("keep-alive响应外层数组为空");
                                 return;
                             }
-                        };
-                        
-                        debug!("keep-alive响应内层数组内容: {:?}", inner_array);
-                        
-                        // 检查错误对象 [Array [Array [Object {"message": String("错误信息")}, ...]]]
-                        if inner_array.len() >= 1 && inner_array[0].is_object() && !inner_array[0].is_null() {
-                            if let Some(err_obj) = inner_array[0].as_object() {
-                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
-                                    error!("keep-alive错误: {}", msg);
-                                } else {
-                                    error!("keep-alive未知错误: {:?}", inner_array[0]);
+                            
+                            // 安全地尝试获取内层数组
+                            let inner_array = match outer_array.get(0) {
+                                Some(array) if array.is_array() => array.as_array().unwrap(),
+                                _ => {
+                                    warn!("keep-alive响应格式错误: 第二层元素不是数组");
+                                    debug!("outer_array内容: {:?}", outer_array);
+                                    return;
+                                }
+                            };
+                            
+                            debug!("keep-alive响应内层数组内容: {:?}", inner_array);
+                            
+                            // 检查错误对象 [Array [Array [Object {"message": String("错误信息")}, ...]]]
+                            if !inner_array.is_empty() && inner_array[0].is_object() && !inner_array[0].is_null() {
+                                if let Some(err_obj) = inner_array[0].as_object() {
+                                    if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                        error!("keep-alive错误: {}", msg);
+                                    } else {
+                                        error!("keep-alive未知错误: {:?}", inner_array[0]);
+                                    }
                                 }
                             }
-                        }
-                        
-                        // 检查日期响应 [Array [Array [Null, String("2025-03-25T00:14:52.245Z")]]]
-                        if inner_array.len() < 2 {
-                            warn!("keep-alive响应内层数组长度不足，没有第二个元素");
-                            debug!("inner_array长度: {}, 内容: {:?}", inner_array.len(), inner_array);
-                        } else if inner_array[1].is_null() {
-                            warn!("keep-alive响应内层数组第二个元素为null");
-                            debug!("inner_array内容: {:?}", inner_array);
-                        } else {
-                            debug!("keep-alive响应成功，服务器返回时间戳: {:?}", inner_array[1]);
-                        }
-                    },
-                    _ => warn!("收到非文本格式的keep-alive响应"),
+                            
+                            // 检查日期响应 [Array [Array [Null, String("2025-03-25T00:14:52.245Z")]]]
+                            if inner_array.len() < 2 {
+                                warn!("keep-alive响应内层数组长度不足，没有第二个元素");
+                                debug!("inner_array长度: {}, 内容: {:?}", inner_array.len(), inner_array);
+                            } else if inner_array[1].is_null() {
+                                warn!("keep-alive响应内层数组第二个元素为null");
+                                debug!("inner_array内容: {:?}", inner_array);
+                            } else {
+                                debug!("keep-alive响应成功，服务器返回时间戳: {:?}", inner_array[1]);
+                            }
+                        },
+                        _ => warn!("收到非文本格式的keep-alive响应"),
+                    }
+                }.boxed()
+            }).await
+        }));
+        
+        // 处理panic情况
+        let emit_result = match result {
+            Ok(async_result) => match tokio::time::timeout(Duration::from_secs(15), async_result).await {
+                Ok(r) => r,
+                Err(_) => {
+                    error!("keep-alive响应超时");
+                    return Err(anyhow!("keep alive error: 响应超时"));
                 }
-            }.boxed()
-        }).await;
+            },
+            Err(e) => {
+                let panic_msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "未知panic".to_string()
+                };
+                
+                error!("keep-alive发送过程中发生panic: {}", panic_msg);
+                
+                // 将节点状态设置为未启用
+                {
+                    let mut is_enabled = self.is_enabled.write().unwrap();
+                    if *is_enabled {
+                        warn!("由于panic，将节点状态设置为未启用");
+                        *is_enabled = false;
+                    }
+                }
+                
+                return Err(anyhow!("keep alive error: 处理过程发生panic: {}", panic_msg));
+            }
+        };
         
         // 处理结果
-        match result {
+        match emit_result {
             Ok(_) => {
                 // 心跳成功发送后，更新计数器
                 let mut counters = self.counters.write().unwrap();

@@ -979,6 +979,11 @@ impl Cluster {
     }
     
     pub async fn send_heartbeat(&self) -> Result<()> {
+        // 检查是否启用
+        if !*self.is_enabled.read().unwrap() {
+            return Err(anyhow!("节点未启用"));
+        }
+
         // 获取当前计数器状态
         let current_counter = {
             let counters = self.counters.read().unwrap();
@@ -988,7 +993,7 @@ impl Cluster {
             counter_copy
         };
 
-        // 构建心跳请求
+        // 获取socket
         let socket_result = {
             let socket_guard = self.socket.read().unwrap();
             socket_guard.clone()
@@ -997,42 +1002,85 @@ impl Cluster {
         let socket = match socket_result {
             Some(socket) => socket,
             None => {
-                debug!("没有已连接的WebSocket，跳过心跳发送");
-                return Ok(());
+                return Err(anyhow!("未连接到服务器"));
             }
         };
 
-        // 心跳数据不再包含IP信息
+        // 构建消息负载，与TS版本完全一致
         let payload = json!({
-            "type": "heartbeat",
-            "version": self.version,
-            "publicPort": self.public_port,
-            "metrics": {
-                "hits": current_counter.hits,
-                "bytes": current_counter.bytes
-            }
+            "time": chrono::Utc::now().to_rfc3339(),
+            "hits": current_counter.hits,
+            "bytes": current_counter.bytes
         });
 
         // 发送心跳
-        debug!("发送心跳: {}", payload);
-        match socket.emit("heartbeat", payload).await {
+        debug!("发送keep-alive: {}", payload);
+        
+        // 使用emit_with_ack并正确处理响应
+        let result = socket.emit_with_ack("keep-alive", payload, Duration::from_secs(10), |response: Payload, _| {
+            async move {
+                match response {
+                    Payload::Text(values) => {
+                        debug!("处理keep-alive响应: {:?}", values);
+                        
+                        if values.is_empty() {
+                            warn!("keep-alive响应为空");
+                            return;
+                        }
+                        
+                        // 检查是否有错误
+                        let outer_array = match values.get(0) {
+                            Some(array) if array.is_array() => array.as_array().unwrap(),
+                            _ => {
+                                warn!("keep-alive响应格式错误: 第一元素不是数组");
+                                debug!("收到的完整响应内容: {:?}", values);
+                                return;
+                            }
+                        };           
+                        
+                        // 检查错误对象
+                        if outer_array.len() >= 1 && outer_array[0].is_object() && !outer_array[0].is_null() {
+                            if let Some(err_obj) = outer_array[0].as_object() {
+                                if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+                                    error!("keep-alive错误: {}", msg);
+                                } else {
+                                    error!("keep-alive未知错误: {:?}", outer_array[0]);
+                                }
+                            }
+                        }
+                        
+                        if outer_array.len() < 2 || outer_array[1].is_null() {
+                            warn!("keep-alive响应没有第二个元素或为null");
+                            debug!("outer_array长度: {}, 内容: {:?}", outer_array.len(), outer_array);
+                        } else {
+                            debug!("keep-alive响应第二个元素值: {:?}", outer_array[1]);
+                        }
+                    },
+                    _ => warn!("收到非文本格式的keep-alive响应"),
+                }
+            }.boxed()
+        }).await;
+        
+        // 处理结果
+        match result {
             Ok(_) => {
-                // 心跳成功发送后，重置计数器
+                // 心跳成功发送后，更新计数器
                 let mut counters = self.counters.write().unwrap();
-                let old_hits = counters.hits;
-                let old_bytes = counters.bytes;
-                counters.hits = 0;
-                counters.bytes = 0;
-                info!("心跳发送成功，更新计数器 - 本次上报计数 hits: {}, bytes: {}", old_hits, old_bytes);
+                counters.hits -= current_counter.hits;
+                counters.bytes -= current_counter.bytes;
+                
+                // 格式化字节数
+                let bytes_str = bytesize::to_string(current_counter.bytes, true);
+                info!("keep alive success, serve {} files, {}", current_counter.hits, bytes_str);
                 
                 Ok(())
             },
             Err(e) => {
-                error!("心跳发送失败: {}", e);
+                error!("keep-alive发送失败: {}", e);
                 
                 // 检测是否需要重新连接
                 if e.to_string().contains("not connected") || e.to_string().contains("connection") {
-                    warn!("检测到WebSocket连接已断开，尝试重新设置连接状态");
+                    warn!("检测到WebSocket连接已断开");
                     {
                         let mut is_enabled = self.is_enabled.write().unwrap();
                         if *is_enabled {
@@ -1040,38 +1088,9 @@ impl Cluster {
                             *is_enabled = false;
                         }
                     }
-                    
-                    // 尝试重新连接
-                    if *self.want_enable.read().unwrap() {
-                        info!("节点希望保持启用状态，将在下一个循环中尝试重新连接");
-                        
-                        // 避免循环引用，只克隆需要的字段
-                        let base_url = self.base_url.clone();
-                        let token_manager = self.token_manager.clone();
-                        
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            info!("尝试重新连接到 {}", base_url);
-                            
-                            match token_manager.get_token().await {
-                                Ok(token) => {
-                                    let result = ClientBuilder::new(&base_url)
-                                        .transport_type(TransportType::Websocket)
-                                        .auth(json!({"token": token}))
-                                        .connect().await;
-                                        
-                                    match result {
-                                        Ok(_) => info!("重新连接成功"),
-                                        Err(e) => error!("重新连接失败: {}", e),
-                                    }
-                                },
-                                Err(e) => error!("获取令牌失败: {}", e),
-                            }
-                        });
-                    }
                 }
                 
-                Err(anyhow!("心跳发送失败: {}", e))
+                Err(anyhow!("keep alive error: {}", e))
             }
         }
     }

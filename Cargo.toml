@@ -57,6 +57,7 @@ bytes = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 zstd = { version = "0.13", default-features = false }
 url = "2.4"
+bytesize = "1.3"
 
 # 工具库
 lazy_static = "1.4"

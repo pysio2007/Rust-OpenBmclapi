@@ -1025,10 +1025,11 @@ impl Cluster {
                         
                         if values.is_empty() {
                             warn!("keep-alive响应为空");
+                            debug!("收到的完整响应内容: {:?}", values);
                             return;
                         }
                         
-                        // 检查是否有错误
+                        // 第一层数组
                         let outer_array = match values.get(0) {
                             Some(array) if array.is_array() => array.as_array().unwrap(),
                             _ => {
@@ -1036,24 +1037,40 @@ impl Cluster {
                                 debug!("收到的完整响应内容: {:?}", values);
                                 return;
                             }
-                        };           
+                        };
                         
-                        // 检查错误对象
-                        if outer_array.len() >= 1 && outer_array[0].is_object() && !outer_array[0].is_null() {
-                            if let Some(err_obj) = outer_array[0].as_object() {
+                        // 第二层数组
+                        let inner_array = match outer_array.get(0) {
+                            Some(array) if array.is_array() => array.as_array().unwrap(),
+                            _ => {
+                                warn!("keep-alive响应格式错误: 第二层元素不是数组");
+                                debug!("outer_array内容: {:?}", outer_array);
+                                return;
+                            }
+                        };
+                        
+                        debug!("keep-alive响应内层数组内容: {:?}", inner_array);
+                        
+                        // 检查错误对象 [Array [Array [Object {"message": String("错误信息")}, ...]]]
+                        if inner_array.len() >= 1 && inner_array[0].is_object() && !inner_array[0].is_null() {
+                            if let Some(err_obj) = inner_array[0].as_object() {
                                 if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
                                     error!("keep-alive错误: {}", msg);
                                 } else {
-                                    error!("keep-alive未知错误: {:?}", outer_array[0]);
+                                    error!("keep-alive未知错误: {:?}", inner_array[0]);
                                 }
                             }
                         }
                         
-                        if outer_array.len() < 2 || outer_array[1].is_null() {
-                            warn!("keep-alive响应没有第二个元素或为null");
-                            debug!("outer_array长度: {}, 内容: {:?}", outer_array.len(), outer_array);
+                        // 检查日期响应 [Array [Array [Null, String("2025-03-25T00:14:52.245Z")]]]
+                        if inner_array.len() < 2 {
+                            warn!("keep-alive响应内层数组长度不足，没有第二个元素");
+                            debug!("inner_array长度: {}, 内容: {:?}", inner_array.len(), inner_array);
+                        } else if inner_array[1].is_null() {
+                            warn!("keep-alive响应内层数组第二个元素为null");
+                            debug!("inner_array内容: {:?}", inner_array);
                         } else {
-                            debug!("keep-alive响应第二个元素值: {:?}", outer_array[1]);
+                            debug!("keep-alive响应成功，服务器返回时间戳: {:?}", inner_array[1]);
                         }
                     },
                     _ => warn!("收到非文本格式的keep-alive响应"),

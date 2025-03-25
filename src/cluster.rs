@@ -988,7 +988,7 @@ impl Cluster {
         let current_counter = {
             let counters = self.counters.read().unwrap();
             let counter_copy = counters.clone();
-            info!("准备上报计数器数据 - hits: {}, bytes: {}", 
+            debug!("准备上报计数器数据 - hits: {}, bytes: {}", 
                 counter_copy.hits, counter_copy.bytes);
             counter_copy
         };

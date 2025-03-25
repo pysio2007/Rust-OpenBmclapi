@@ -820,33 +820,6 @@ impl Cluster {
                 }
                 info!("节点注册流程完成，开始工作");
                 
-                // 启动 keepalive
-                let cluster = self.clone();
-                tokio::spawn(async move {
-                    info!("启动 keepalive 任务");
-                    
-                    // 发送首次心跳
-                    if let Err(e) = cluster.send_heartbeat().await {
-                        error!("首次发送心跳失败: {}", e);
-                    }
-                    
-                    let mut interval = tokio::time::interval(Duration::from_secs(60));
-                    while *cluster.is_enabled.read().unwrap() {
-                        interval.tick().await;
-                        
-                        // 发送心跳
-                        match cluster.send_heartbeat().await {
-                            Ok(_) => {
-                                debug!("心跳发送成功，计数器已在send_heartbeat中更新");
-                            }
-                            Err(e) => {
-                                error!("发送心跳失败: {}", e);
-                            }
-                        }
-                    }
-                    info!("keepalive 任务结束");
-                });
-                
                 Ok(())
             },
             Ok(Some(Err(e))) => {

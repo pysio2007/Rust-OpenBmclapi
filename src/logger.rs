@@ -30,7 +30,17 @@ pub fn init_logger() -> Result<()> {
     // 设置日志级别
     if std::env::var("RUST_LOG").is_err() {
         // 默认日志级别为INFO，但可以通过RUST_LOG环境变量覆盖
-        std::env::set_var("RUST_LOG", "info,rust_bmclapi=info,axum::server=info,axum::http=info");
+        std::env::set_var("RUST_LOG", "info,rust_bmclapi=info,axum::server=info,axum::http=info,rustls::common_state=error");
+    } else {
+        // 如果用户已设置RUST_LOG，添加rustls过滤器
+        let mut log_env = std::env::var("RUST_LOG").unwrap_or_default();
+        if !log_env.contains("rustls::common_state") {
+            if !log_env.is_empty() {
+                log_env.push_str(",");
+            }
+            log_env.push_str("rustls::common_state=error");
+            std::env::set_var("RUST_LOG", log_env);
+        }
     }
 
     // 确保logs目录存在
@@ -83,6 +93,16 @@ pub fn init_logger() -> Result<()> {
     // 配置环境日志格式
     env_logger::Builder::new()
         .format(|buf, record| {
+            // 过滤掉TLS警告
+            if record.target().contains("rustls") {
+                let msg = format!("{}", record.args());
+                if msg.contains("TLS alert warning received") || 
+                   msg.contains("UserCanceled") {
+                    // 返回空字符串表示不输出此日志
+                    return Ok(());
+                }
+            }
+            
             let mut style = buf.style();
             let level_color = match record.level() {
                 Level::Error => Color::Red,

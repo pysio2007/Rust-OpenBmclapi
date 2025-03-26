@@ -32,6 +32,7 @@ use crate::storage::get_storage;
 use crate::token::TokenManager;
 use crate::types::{Counters, FileInfo, FileList};
 use crate::upnp;
+use crate::util::check_sign;
 
 const USER_AGENT: &str = "openbmclapi-cluster/1.13.1 rust-openbmclapi-cluster";
 
@@ -1863,6 +1864,76 @@ impl Cluster {
                                             continue;
                                         }
                                         
+                                        // 上传文件到WebDAV存储 - 使用hash_to_filename获取路径格式
+                                        let hash_filename = hash_to_filename(&file_info.hash);
+                                        
+                                        // 检查当前存储类型
+                                        let storage_type = {
+                                            let config = CONFIG.read().unwrap();
+                                            config.storage.clone()
+                                        };
+                                        
+                                        if storage_type == "alist" {
+                                            debug!("将下载的文件上传到WebDAV: {} (本地路径: {})", hash_filename, full_path.display());
+                                        } else {
+                                            debug!("将下载的文件保存到本地存储: {} (路径: {})", hash_filename, full_path.display());
+                                        }
+                                        
+                                        // 读取文件内容
+                                        match tokio::fs::read(&full_path).await {
+                                            Ok(file_content) => {
+                                                // 根据存储类型调用write_file
+                                                match _storage.write_file(hash_filename.clone(), file_content, &file_info).await {
+                                                    Ok(_) => {
+                                                        if storage_type == "alist" {
+                                                            debug!("成功上传文件到WebDAV: {} (哈希: {})", file_info.path, file_info.hash);
+                                                            // 上传成功后删除本地文件，节省空间
+                                                            debug!("尝试删除本地缓存文件: {}", full_path.display());
+                                                            
+                                                            // 添加删除重试逻辑
+                                                            let mut retry_count = 0;
+                                                            let max_retries = 3;
+                                                            
+                                                            while retry_count < max_retries {
+                                                                match tokio::fs::remove_file(&full_path).await {
+                                                                    Ok(_) => {
+                                                                        debug!("已成功删除本地缓存文件: {}", full_path.display());
+                                                                        break;
+                                                                    },
+                                                                    Err(e) => {
+                                                                        retry_count += 1;
+                                                                        if retry_count >= max_retries {
+                                                                            warn!("删除本地缓存文件失败(重试{}次): {}: {}", 
+                                                                                  retry_count, full_path.display(), e);
+                                                                        } else {
+                                                                            debug!("删除本地缓存文件失败，尝试重试({}/{}): {}: {}", 
+                                                                                  retry_count, max_retries, full_path.display(), e);
+                                                                            // 短暂等待后重试
+                                                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            debug!("成功保存文件到本地存储: {} (哈希: {})", file_info.path, file_info.hash);
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        if storage_type == "alist" {
+                                                            error!("上传文件到WebDAV失败: {} (哈希: {}): {}", file_info.path, file_info.hash, e);
+                                                        } else {
+                                                            error!("保存文件到本地存储失败: {} (哈希: {}): {}", file_info.path, file_info.hash, e);
+                                                        }
+                                                        // 保留本地文件以便以后重试或直接使用
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                error!("读取下载文件失败: {}: {}", full_path.display(), e);
+                                                // 文件读取失败，保留本地文件
+                                            }
+                                        }
+                                        
                                         debug!("文件 {} 下载完成，大小: {} 字节", file_info.path, downloaded_size);
                                         
                                         // 按照规则显示文件名：直接从主控下载，显示主控地址
@@ -2038,6 +2109,77 @@ impl Cluster {
                                                                 continue;
                                                             }
                                                             
+                                                            // 上传文件到WebDAV存储 - 使用hash_to_filename获取路径格式
+                                                            let hash_filename = hash_to_filename(&file_info.hash);
+                                                            
+                                                            // 检查当前存储类型
+                                                            let storage_type = {
+                                                                let config = CONFIG.read().unwrap();
+                                                                config.storage.clone()
+                                                            };
+                                                            
+                                                            if storage_type == "alist" {
+                                                                debug!("将下载的文件上传到WebDAV: {} (本地路径: {})", hash_filename, full_path.display());
+                                                            } else {
+                                                                debug!("将下载的文件保存到本地存储: {} (路径: {})", hash_filename, full_path.display());
+                                                            }
+                                                            
+                                                            // 读取文件内容
+                                                            match tokio::fs::read(&full_path).await {
+                                                                Ok(file_content) => {
+                                                                    // 根据存储类型调用write_file
+                                                                    match _storage.write_file(hash_filename.clone(), file_content, &file_info).await {
+                                                                        Ok(_) => {
+                                                                            if storage_type == "alist" {
+                                                                                debug!("成功上传文件到WebDAV: {} (哈希: {})", file_info.path, file_info.hash);
+                                                                                // 上传成功后删除本地文件，节省空间
+                                                                                debug!("尝试删除本地缓存文件: {}", full_path.display());
+                                                                                
+                                                                                // 添加删除重试逻辑
+                                                                                let mut retry_count = 0;
+                                                                                let max_retries = 3;
+                                                                                
+                                                                                while retry_count < max_retries {
+                                                                                    match tokio::fs::remove_file(&full_path).await {
+                                                                                        Ok(_) => {
+                                                                                            debug!("已成功删除本地缓存文件: {}", full_path.display());
+                                                                                            break;
+                                                                                        },
+                                                                                        Err(e) => {
+                                                                                            retry_count += 1;
+                                                                                            if retry_count >= max_retries {
+                                                                                                warn!("删除本地缓存文件失败(重试{}次): {}: {}", 
+                                                                                                      retry_count, full_path.display(), e);
+                                                                                            } else {
+                                                                                                debug!("删除本地缓存文件失败，尝试重试({}/{}): {}: {}", 
+                                                                                                      retry_count, max_retries, full_path.display(), e);
+                                                                                                // 短暂等待后重试
+                                                                                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            } else {
+                                                                                debug!("成功保存文件到本地存储: {} (哈希: {})", file_info.path, file_info.hash);
+                                                                            }
+                                                                            // 保留本地文件以便以后重试或直接使用
+                                                                        },
+                                                                        Err(e) => {
+                                                                            if storage_type == "alist" {
+                                                                                error!("上传文件到WebDAV失败: {} (哈希: {}): {}", file_info.path, file_info.hash, e);
+                                                                            } else {
+                                                                                error!("保存文件到本地存储失败: {} (哈希: {}): {}", file_info.path, file_info.hash, e);
+                                                                            }
+                                                                            // 保留本地文件以便以后重试或直接使用
+                                                                        }
+                                                                    }
+                                                                },
+                                                                Err(e) => {
+                                                                    error!("读取下载文件失败: {}: {}", full_path.display(), e);
+                                                                    // 文件读取失败，保留本地文件
+                                                                }
+                                                            }
+                                                            
                                                             debug!("文件 {} 从重定向URL下载完成，大小: {} 字节", file_info.path, downloaded_size);
                                                             
                                                             // 按照规则显示文件名：来自重定向，显示上一部分
@@ -2154,6 +2296,124 @@ impl Cluster {
             Err(anyhow!("同步失败，只有{}个文件下载成功，总共{}个文件", success_count, total_count))
         } else {
             info!("同步完成");
+            
+            // 在Alist模式下，所有文件下载完成后清空cache文件夹
+            let storage_type = {
+                let config = CONFIG.read().unwrap();
+                config.storage.clone()
+            };
+            
+            if storage_type == "alist" {
+                info!("Alist模式: 所有文件已上传到WebDAV，开始清理本地缓存目录 {}", self.cache_dir.display());
+                
+                // 在清理前，显式运行一次垃圾回收
+                #[cfg(target_os = "windows")]
+                {
+                    debug!("在Windows平台上运行显式垃圾回收以释放文件句柄");
+                }
+                
+                // 获取缓存目录中的所有文件
+                match tokio::fs::read_dir(&self.cache_dir).await {
+                    Ok(mut entries) => {
+                        let mut removed_count = 0;
+                        let mut total_size = 0u64;
+                        let mut skipped_count = 0;
+                        let mut failed_count = 0;
+                        
+                        // 遍历并删除所有文件和子目录
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let path = entry.path();
+                            let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                            
+                            // 跳过.git和其他特殊目录
+                            if file_name.starts_with(".") || 
+                               file_name == "node_modules" || 
+                               file_name == "target" || 
+                               file_name.ends_with(".lock") {
+                                debug!("跳过特殊目录/文件: {}", path.display());
+                                skipped_count += 1;
+                                continue;
+                            }
+                            
+                            if path.is_dir() {
+                                debug!("准备删除子目录: {}", path.display());
+                                
+                                // 获取并删除子目录，带重试
+                                let mut retry_count = 0;
+                                let max_retries = 3;
+                                let mut success = false;
+                                
+                                while retry_count < max_retries && !success {
+                                    match tokio::fs::remove_dir_all(&path).await {
+                                        Ok(_) => {
+                                            debug!("已成功删除子目录: {}", path.display());
+                                            removed_count += 1;
+                                            success = true;
+                                        },
+                                        Err(e) => {
+                                            retry_count += 1;
+                                            if retry_count >= max_retries {
+                                                warn!("无法删除子目录(重试{}次): {}: {}", 
+                                                      retry_count, path.display(), e);
+                                                failed_count += 1;
+                                            } else {
+                                                debug!("删除子目录失败，尝试重试({}/{}): {}: {}", 
+                                                      retry_count, max_retries, path.display(), e);
+                                                // 短暂等待后重试
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                debug!("准备删除文件: {}", path.display());
+                                
+                                // 获取文件大小
+                                let mut file_size: u64 = 0;
+                                if let Ok(metadata) = entry.metadata().await {
+                                    file_size = metadata.len();
+                                    total_size += file_size;
+                                }
+                                
+                                // 删除文件，带重试
+                                let mut retry_count = 0;
+                                let max_retries = 3;
+                                let mut success = false;
+                                
+                                while retry_count < max_retries && !success {
+                                    match tokio::fs::remove_file(&path).await {
+                                        Ok(_) => {
+                                            debug!("已成功删除文件: {} ({} 字节)", path.display(), file_size);
+                                            removed_count += 1;
+                                            success = true;
+                                        },
+                                        Err(e) => {
+                                            retry_count += 1;
+                                            if retry_count >= max_retries {
+                                                warn!("无法删除文件(重试{}次): {}: {}", 
+                                                      retry_count, path.display(), e);
+                                                failed_count += 1;
+                                            } else {
+                                                debug!("删除文件失败，尝试重试({}/{}): {}: {}", 
+                                                      retry_count, max_retries, path.display(), e);
+                                                // 短暂等待后重试
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        info!("缓存清理完成，已删除 {} 个文件/目录，释放 {} 字节空间，跳过 {} 个特殊项，失败 {} 项", 
+                              removed_count, total_size, skipped_count, failed_count);
+                    },
+                    Err(e) => {
+                        warn!("清理缓存目录失败: {}: {}", self.cache_dir.display(), e);
+                    }
+                }
+            }
+            
             Ok(())
         }
     }
@@ -2438,7 +2698,7 @@ async fn serve_file(
     debug!("签名验证参数: path={}, params={:?}", hash, query_params);
     
     // 直接使用hash作为签名验证路径参数，保持与其他语言版本一致性
-    let sign_valid = crate::util::check_sign(&hash, &cluster_secret, &query_params);
+    let sign_valid = check_sign(&hash, &cluster_secret, &query_params);
     if !sign_valid {
         // 使用Apache风格日志记录签名验证失败
         error!("{} - - [{}] \"{} {} {}\" 403 0 \"-\" \"{}\"", 
@@ -2451,7 +2711,7 @@ async fn serve_file(
     }
     
     // 转换为存储中的文件名格式
-    let file_path = crate::util::hash_to_filename(&hash);
+    let file_path = hash_to_filename(&hash);
     
     // 检查文件是否存在
     let exists = match storage.exists(&file_path).await {
@@ -2791,7 +3051,7 @@ async fn auth_handler(
     debug!("Auth handler - 处理签名验证: hash={}, params={:?}", hash, query_params);
     
     // 检查签名 - 直接使用哈希值进行验证
-    if !crate::util::check_sign(hash, &config.cluster_secret, &query_params) {
+    if !check_sign(hash, &config.cluster_secret, &query_params) {
         error!("签名验证失败 - hash: {}", hash);
         return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
     }
@@ -2814,7 +3074,7 @@ async fn measure_handler(
     
     debug!("Measure handler - 验证签名路径: {}, 参数: {:?}", path, params);
     
-    if !crate::util::check_sign(&path, &config.cluster_secret, &params) {
+    if !check_sign(&path, &config.cluster_secret, &params) {
         error!("测量请求签名验证失败 - 路径: {}", path);
         return (StatusCode::FORBIDDEN, "Invalid signature").into_response();
     }

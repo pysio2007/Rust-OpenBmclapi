@@ -28,6 +28,7 @@ pub struct Config {
     // 存储配置
     pub storage: String,
     pub storage_opts: Option<serde_json::Value>,
+    pub alist_opts: Option<AlistStorageConfig>,
     
     // SSL配置
     pub ssl_key: Option<String>,
@@ -42,6 +43,16 @@ pub struct Config {
     
     // 运行时信息
     pub flavor: ConfigFlavor,
+}
+
+/// AList WebDAV存储配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlistStorageConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub base_path: String,
+    pub cache_ttl: String,
 }
 
 impl Config {
@@ -66,7 +77,18 @@ impl Config {
                  # 设置对外公开的端口（可选，默认与监听端口相同）\n\
                  # CLUSTER_PUBLIC_PORT=4000\n\
                  # 是否启用指标收集（可选，默认关闭）\n\
-                 # ENABLE_METRICS=false\n";
+                 # ENABLE_METRICS=false\n\
+                 # 存储类型（可选，默认file）\n\
+                 # CLUSTER_STORAGE=file\n\
+                 \n\
+                 # 如果使用Alist存储，可以通过以下两种方式之一配置:\n\
+                 # 1. JSON方式配置:\n\
+                 # CLUSTER_STORAGE_OPTIONS={\"url\":\"http://example.com/dav\",\"username\":\"user\",\"password\":\"pass\",\"basePath\":\"/openbmclapi\"}\n\
+                 # 2. 分离环境变量方式配置:\n\
+                 # ALIST_URL=http://example.com/dav\n\
+                 # ALIST_USERNAME=user\n\
+                 # ALIST_PASSWORD=pass\n\
+                 # ALIST_BASE_PATH=/openbmclapi\n";
             
             fs::write(env_path, env_content)?;
             info!("已创建.env文件模板，请填写必要的配置项");
@@ -110,9 +132,20 @@ impl Config {
         let enable_metrics = env::var("ENABLE_METRICS").map(|v| v == "true" || v == "1").unwrap_or(false);
         
         let storage = env::var("CLUSTER_STORAGE").unwrap_or_else(|_| "file".to_string());
+        
+        // 存储选项可以通过两种方式配置：
+        // 1. JSON方式: CLUSTER_STORAGE_OPTIONS={"url":"http://example.com/dav","username":"user",...}
+        // 2. 单独环境变量方式: 使用ALIST_URL、ALIST_USERNAME等变量
         let storage_opts = env::var("CLUSTER_STORAGE_OPTIONS")
             .map(|v| serde_json::from_str(&v).unwrap_or(serde_json::Value::Null))
             .ok();
+            
+        // 解析ALIST配置 (如果存储类型是alist)
+        let alist_opts = if storage == "alist" {
+            Some(Self::parse_alist_config(&storage_opts))
+        } else {
+            None
+        };
         
         let ssl_key = env::var("SSL_KEY").ok();
         let ssl_cert = env::var("SSL_CERT").ok();
@@ -137,11 +170,129 @@ impl Config {
             enable_metrics,
             storage,
             storage_opts,
+            alist_opts,
             ssl_key,
             ssl_cert,
             debug_log,
             flavor,
         })
+    }
+    
+    /// 解析ALIST存储的配置，支持两种模式：JSON和独立环境变量
+    fn parse_alist_config(storage_opts: &Option<serde_json::Value>) -> AlistStorageConfig {
+        // 如果有JSON配置，优先使用
+        if let Some(opts) = storage_opts {
+            if let Some(obj) = opts.as_object() {
+                info!("使用JSON配置Alist WebDAV存储");
+                
+                // 从JSON获取参数
+                let url = obj.get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").trim().to_string();
+                    
+                let username = obj.get("username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_string();
+                    
+                let password = obj.get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_string();
+                    
+                let base_path = obj.get("basePath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/").trim().to_string();
+                    
+                let cache_ttl = obj.get("cacheTtl")
+                    .map(|v| {
+                        if let Some(s) = v.as_str() {
+                            s.to_string()
+                        } else if let Some(n) = v.as_i64() {
+                            n.to_string()
+                        } else {
+                            "1h".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "1h".to_string());
+                
+                if url.is_empty() {
+                    panic!("错误: WebDAV URL不能为空，请检查配置");
+                }
+                
+                return AlistStorageConfig {
+                    url,
+                    username,
+                    password,
+                    base_path,
+                    cache_ttl,
+                };
+            }
+        }
+        
+        // 从环境变量获取配置
+        info!("使用环境变量配置Alist WebDAV存储");
+        let url = env::var("ALIST_URL")
+            .or_else(|_| env::var("WEBDAV_URL"))
+            .unwrap_or_else(|_| "".to_string())
+            .trim().to_string();
+            
+        let username = env::var("ALIST_USERNAME")
+            .or_else(|_| env::var("WEBDAV_USERNAME"))
+            .unwrap_or_else(|_| "".to_string());
+            
+        let password = env::var("ALIST_PASSWORD")
+            .or_else(|_| env::var("WEBDAV_PASSWORD"))
+            .unwrap_or_else(|_| "".to_string());
+            
+        let base_path = env::var("ALIST_BASE_PATH")
+            .or_else(|_| env::var("WEBDAV_BASE_PATH"))
+            .unwrap_or_else(|_| "/".to_string())
+            .trim().to_string();
+            
+        let cache_ttl = env::var("ALIST_CACHE_TTL")
+            .unwrap_or_else(|_| "1h".to_string());
+        
+        if url.is_empty() {
+            panic!("错误: WebDAV URL不能为空，请检查环境变量ALIST_URL或WEBDAV_URL");
+        }
+        
+        AlistStorageConfig {
+            url,
+            username,
+            password,
+            base_path,
+            cache_ttl,
+        }
+    }
+    
+    /// 获取Alist存储的配置对象
+    pub fn get_alist_config(&self) -> Option<serde_json::Value> {
+        if let Some(config) = &self.alist_opts {
+            let mut map = serde_json::Map::new();
+            
+            // 转换url为合法URL
+            let url = if !config.url.starts_with("http://") && !config.url.starts_with("https://") {
+                format!("http://{}", config.url)
+            } else {
+                config.url.clone()
+            };
+            
+            // 转换路径以确保有前导斜杠
+            let base_path = if !config.base_path.starts_with("/") {
+                format!("/{}", config.base_path)
+            } else {
+                config.base_path.clone()
+            };
+            
+            map.insert("url".to_string(), serde_json::Value::String(url));
+            map.insert("username".to_string(), serde_json::Value::String(config.username.clone()));
+            map.insert("password".to_string(), serde_json::Value::String(config.password.clone()));
+            map.insert("basePath".to_string(), serde_json::Value::String(base_path));
+            map.insert("cacheTtl".to_string(), serde_json::Value::String(config.cache_ttl.clone()));
+            
+            Some(serde_json::Value::Object(map))
+        } else {
+            None
+        }
     }
 }
 

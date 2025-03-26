@@ -48,13 +48,16 @@ pub fn get_storage(config: &Config, cache_dir: Option<std::path::PathBuf>) -> Bo
             Box::new(storage)
         }
         "alist" => {
-            if let Some(opts) = &config.storage_opts {
-                let storage = AlistWebdavStorage::new(opts.clone());
-                info!("使用Alist WebDAV存储");
-                Box::new(storage)
+            // 获取已解析好的AList配置
+            let storage_opts = if let Some(opts) = config.get_alist_config() {
+                opts
             } else {
-                panic!("使用Alist存储需要提供storage_opts");
-            }
+                panic!("获取AList WebDAV配置失败");
+            };
+            
+            let storage = AlistWebdavStorage::new(storage_opts);
+            info!("使用Alist WebDAV存储");
+            Box::new(storage)
         }
         _ => panic!("未知的存储类型: {}", config.storage),
     }

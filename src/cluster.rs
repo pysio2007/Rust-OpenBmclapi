@@ -957,10 +957,14 @@ impl Cluster {
             return Err(anyhow!("节点未启用"));
         }
         
-        // 获取当前计数器状态
+        // 使用原子操作获取当前计数器状态，并立即清零
         let current_counter = {
-            let counters = self.counters.read().unwrap();
-            counters.clone()
+            let mut counters = self.counters.write().unwrap();
+            let counter = counters.clone();
+            // 清零计数器
+            counters.hits = 0;
+            counters.bytes = 0;
+            counter
         };
         
         debug!("当前累计数据: {} 文件, {} 字节", current_counter.hits, current_counter.bytes);
@@ -1096,11 +1100,6 @@ impl Cluster {
         // 处理结果
         match emit_result {
             Ok(_) => {
-                // 心跳成功发送后，更新计数器
-                let mut counters = self.counters.write().unwrap();
-                counters.hits -= current_counter.hits;
-                counters.bytes -= current_counter.bytes;
-                
                 // 格式化字节数
                 let bytes_str = bytesize::to_string(current_counter.bytes, true);
                 info!("keep alive success, serve {} files, {}", current_counter.hits, bytes_str);

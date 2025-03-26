@@ -118,8 +118,31 @@ Rust-OpenBMCLAPI 会自行同步需要的文件，但初次同步可能速度过
 - `CLUSTER_PORT`：服务监听端口，默认4000
 - `CLUSTER_PUBLIC_PORT`：公网访问端口，默认与CLUSTER_PORT相同
 - `ENABLE_UPNP`：是否启用UPnP自动端口映射，默认false
-- `CLUSTER_STORAGE`：存储类型，支持file（本地文件）和webdav（WebDAV）
+- `CLUSTER_STORAGE`：存储类型，支持file（本地文件）和alist（Alist WebDAV）
 - `BMCLAPI_CACHE_DIR`：数据目录位置，默认为 ./cache
+
+### Alist WebDAV存储
+
+如果您希望使用Alist WebDAV作为存储后端，可以配置以下参数：
+
+```env
+# Alist WebDAV存储配置
+CLUSTER_STORAGE=alist
+ALIST_URL=http://192.168.1.150:5244/dav
+ALIST_BASE_PATH=openbmclapi
+ALIST_USERNAME=admin
+ALIST_PASSWORD=admin
+```
+
+参数说明：
+
+- `CLUSTER_STORAGE=alist`：启用Alist WebDAV存储
+- `ALIST_URL`：Alist WebDAV服务的URL地址
+- `ALIST_BASE_PATH`：WebDAV中的基础路径，文件将存储在此路径下
+- `ALIST_USERNAME`：WebDAV登录用户名
+- `ALIST_PASSWORD`：WebDAV登录密码
+
+使用Alist WebDAV存储时，系统会在完成上传后自动清理本地缓存文件，节约磁盘空间。
 
 详细配置请参考`.env.example`文件。
 

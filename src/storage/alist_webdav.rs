@@ -4,7 +4,6 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use reqwest::Client;
 use serde_json::Value;
-use std::path::Path;
 use std::time::Duration;
 use log::{debug, warn};
 use std::collections::{HashMap, HashSet};
@@ -46,6 +45,8 @@ pub struct AlistWebdavStorage {
     empty_files: Arc<RwLock<HashSet<String>>>,
     // 文件信息缓存
     files: Arc<RwLock<HashMap<String, FileInfo>>>,
+    // 目录存在性缓存
+    existing_dirs: Arc<RwLock<HashSet<String>>>,
     cache_ttl: Duration,
 }
 
@@ -135,11 +136,21 @@ impl AlistWebdavStorage {
             redirect_cache: Arc::new(RwLock::new(HashMap::new())),
             empty_files: Arc::new(RwLock::new(HashSet::new())),
             files: Arc::new(RwLock::new(HashMap::new())),
+            existing_dirs: Arc::new(RwLock::new(HashSet::new())),
             cache_ttl,
         }
     }
     
     async fn ensure_dir_exists(&self, path: &str) -> Result<()> {
+        // 先检查目录缓存
+        {
+            let dirs = self.existing_dirs.read().await;
+            if dirs.contains(path) {
+                debug!("目录已在缓存中: {}", path);
+                return Ok(());
+            }
+        }
+        
         let url = format!("{}{}", self.base_url, path);
         
         // 先尝试获取目录信息，看是否存在
@@ -150,6 +161,9 @@ impl AlistWebdavStorage {
             
         if res.status().is_success() {
             debug!("目录已存在: {}", path);
+            // 添加到目录缓存
+            let mut dirs = self.existing_dirs.write().await;
+            dirs.insert(path.to_string());
             return Ok(());
         }
         
@@ -190,11 +204,17 @@ impl AlistWebdavStorage {
             
         if res.status().is_success() {
             debug!("成功创建目录: {}", path);
+            // 添加到目录缓存
+            let mut dirs = self.existing_dirs.write().await;
+            dirs.insert(path.to_string());
             Ok(())
         } else if res.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED || 
                   res.status() == reqwest::StatusCode::CONFLICT {
             // 405表示目录已存在，409表示冲突(可能因为目录已存在)
             debug!("目录可能已存在 (状态: {}): {}", res.status(), path);
+            // 添加到目录缓存
+            let mut dirs = self.existing_dirs.write().await;
+            dirs.insert(path.to_string());
             Ok(())
         } else {
             Err(anyhow!("创建WebDAV目录失败: {} - {}", path, res.status()))
@@ -256,6 +276,9 @@ impl Storage for AlistWebdavStorage {
             self.ensure_dir_exists(&self.path).await?;
         } else {
             debug!("使用WebDAV根目录，跳过目录检查");
+            // 根目录默认存在，添加到缓存
+            let mut dirs = self.existing_dirs.write().await;
+            dirs.insert("/".to_string());
         }
         Ok(())
     }
@@ -283,22 +306,26 @@ impl Storage for AlistWebdavStorage {
             return Ok(());
         }
         
-        let file_url = format!("{}{}/{}", self.base_url, self.path, path);
-        debug!("上传文件URL: {}", file_url);
-        
-        // 确保父目录存在
-        if let Some(parent) = Path::new(&path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let parent_path = format!("{}{}", self.path, 
-                    if parent.to_string_lossy().starts_with("/") {
-                        parent.to_string_lossy().to_string()
-                    } else {
-                        format!("/{}", parent.to_string_lossy())
-                    });
-                debug!("确保父目录存在: {}", parent_path);
-                self.ensure_dir_exists(&parent_path).await?;
+        // 确保哈希前缀目录存在
+        if path.len() >= 2 {
+            let prefix = &path[0..2];
+            let prefix_dir = format!("{}/{}", self.path, prefix);
+            
+            // 检查目录是否在缓存中
+            let prefix_exists = {
+                let dirs = self.existing_dirs.read().await;
+                dirs.contains(&prefix_dir)
+            };
+            
+            // 如果目录不在缓存中，则创建
+            if !prefix_exists {
+                debug!("创建哈希前缀目录: {}", prefix_dir);
+                self.ensure_dir_exists(&prefix_dir).await?;
             }
         }
+        
+        let file_url = format!("{}{}/{}", self.base_url, self.path, path);
+        debug!("上传文件URL: {}", file_url);
         
         // 上传文件
         debug!("上传文件到WebDAV: {}", path);
@@ -332,8 +359,43 @@ impl Storage for AlistWebdavStorage {
             }
         }
         
-        let file_url = format!("{}{}/{}", self.base_url, self.path, path);
+        // 检查哈希前缀目录是否存在
+        if path.len() >= 2 {
+            let prefix = &path[0..2];
+            let prefix_dir = format!("{}/{}", self.path, prefix);
+            
+            // 检查前缀目录是否在缓存中
+            let prefix_dir_exists = {
+                let dirs = self.existing_dirs.read().await;
+                dirs.contains(&prefix_dir)
+            };
+            
+            // 如果前缀目录不存在，直接返回false
+            if !prefix_dir_exists {
+                // 尝试检查前缀目录
+                let prefix_url = format!("{}{}", self.base_url, prefix_dir);
+                let res = self.client.head(&prefix_url)
+                    .basic_auth(&self.username, Some(&self.password))
+                    .send()
+                    .await?;
+                    
+                if !res.status().is_success() {
+                    // 前缀目录不存在，添加到缓存
+                    debug!("哈希前缀目录不存在: {}", prefix_dir);
+                    return Ok(false);
+                } else {
+                    // 前缀目录存在，添加到缓存
+                    let mut dirs = self.existing_dirs.write().await;
+                    dirs.insert(prefix_dir);
+                }
+            }
+        }
         
+        // 构建文件路径
+        let file_path = format!("{}/{}", self.path, path);
+        let file_url = format!("{}{}", self.base_url, file_path);
+        
+        // 检查文件是否存在
         let res = self.client.head(&file_url)
             .basic_auth(&self.username, Some(&self.password))
             .send()
@@ -347,35 +409,116 @@ impl Storage for AlistWebdavStorage {
     }
     
     async fn get_missing_files(&self, files: &[FileInfo]) -> Result<Vec<FileInfo>> {
-        let mut missing_files = Vec::new();
-        
         // 检查本地缓存
         {
             let cached_files = self.files.read().await;
             let empty_files = self.empty_files.read().await;
             
-            for file in files.iter() {
-                if !cached_files.contains_key(&file.hash) && !empty_files.contains(&file.hash) {
-                    missing_files.push(file.clone());
-                }
-            }
-            
-            // 如果已有缓存数据，直接返回结果
             if !cached_files.is_empty() {
+                // 如果已有缓存数据，检查哪些文件不在缓存中
+                let mut missing_files = Vec::new();
+                for file in files.iter() {
+                    if !cached_files.contains_key(&file.hash) && !empty_files.contains(&file.hash) {
+                        missing_files.push(file.clone());
+                    }
+                }
                 return Ok(missing_files);
             }
         }
         
-        // 如果没有缓存，则需要检查每个文件
-        let mut result = Vec::new();
+        // 首先检查根目录是否存在
+        let root_url = format!("{}{}", self.base_url, self.path);
+        debug!("检查WebDAV根目录是否存在: {}", root_url);
+        
+        let res = self.client.head(&root_url)
+            .basic_auth(&self.username, Some(&self.password))
+            .send()
+            .await?;
+            
+        // 如果根目录不存在，则认为所有文件都缺失
+        if !res.status().is_success() {
+            debug!("WebDAV根目录不存在，将下载所有文件: {}", self.path);
+            return Ok(files.to_vec());
+        }
+        
+        // 按照哈希前缀分组检查文件夹是否存在
+        debug!("WebDAV根目录存在，按照哈希前缀检查子目录");
+        
+        // 创建一个包含所有可能的哈希前缀的集合（十六进制，共256个可能）
+        let mut prefix_dirs = HashMap::<String, bool>::new();
+        let mut missing_files = Vec::new();
+        
+        // 先按哈希前缀字符（前2个字符）对文件进行分组
+        let mut files_by_prefix = HashMap::<String, Vec<FileInfo>>::new();
+        
         for file in files.iter() {
-            let exists = self.exists(&file.hash).await?;
-            if !exists {
-                result.push(file.clone());
+            if file.hash.len() < 2 {
+                // 对于异常短的哈希，直接添加到缺失列表
+                missing_files.push(file.clone());
+                continue;
+            }
+            
+            let prefix = file.hash[0..2].to_string();
+            files_by_prefix.entry(prefix).or_insert_with(Vec::new).push(file.clone());
+        }
+        
+        debug!("已将{}个文件按哈希前缀分组为{}个目录", files.len(), files_by_prefix.len());
+        
+        // 检查每个前缀目录是否存在
+        for (prefix, prefix_files) in files_by_prefix.iter() {
+            let prefix_dir = format!("{}/{}", self.path, prefix);
+            let prefix_url = format!("{}{}", self.base_url, prefix_dir);
+            
+            debug!("检查前缀目录: {}", prefix_url);
+            let dir_res = self.client.head(&prefix_url)
+                .basic_auth(&self.username, Some(&self.password))
+                .send()
+                .await?;
+                
+            if !dir_res.status().is_success() {
+                // 如果前缀目录不存在，则该前缀下的所有文件都缺失
+                debug!("前缀目录不存在: {}，添加{}个文件到缺失列表", prefix, prefix_files.len());
+                missing_files.extend(prefix_files.clone());
+                
+                // 记录目录不存在
+                prefix_dirs.insert(prefix.clone(), false);
+            } else {
+                // 前缀目录存在，添加到目录缓存
+                {
+                    let mut dirs = self.existing_dirs.write().await;
+                    dirs.insert(prefix_dir);
+                }
+                
+                // 记录目录存在
+                prefix_dirs.insert(prefix.clone(), true);
+                
+                // 如果前缀目录存在，只检查目录中的少量文件来判断是否需要逐个检查
+                // 选择该前缀下的第一个文件进行检查
+                if let Some(sample_file) = prefix_files.first() {
+                    let exists = self.exists(&sample_file.hash).await?;
+                    
+                    if !exists {
+                        // 如果样本文件不存在，我们假设前缀目录是空的或者所有文件都需要下载
+                        debug!("前缀目录{}存在但样本文件不存在，可能是空目录，添加{}个文件到缺失列表", 
+                            prefix, prefix_files.len());
+                        missing_files.extend(prefix_files.clone());
+                    } else {
+                        // 样本文件存在，逐个检查其余文件
+                        debug!("前缀目录{}存在且有文件，将逐个检查剩余文件", prefix);
+                        
+                        // 从第二个文件开始检查，因为第一个已经检查过了
+                        for file in prefix_files.iter().skip(1) {
+                            if !self.exists(&file.hash).await? {
+                                missing_files.push(file.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
         
-        Ok(result)
+        debug!("文件检查完成，共发现{}个缺失文件", missing_files.len());
+        Ok(missing_files)
     }
     
     async fn gc(&self, _files: &[FileInfo]) -> Result<GCCounter> {
